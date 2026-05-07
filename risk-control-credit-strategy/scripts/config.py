@@ -124,7 +124,7 @@ class CausalInferenceConfig:
 
 @dataclass
 class StrategyTuningConfig:
-    """策略调优配置"""
+    """Strategy tuning configuration."""
     target_bad_rates: Dict[str, float] = field(default_factory=lambda: {
         "very_low_risk": 0.02,
         "low_risk": 0.05,
@@ -141,7 +141,7 @@ class StrategyTuningConfig:
 
 @dataclass
 class VintageAnalysisConfig:
-    """老贷款批次（Vintage）分析配置"""
+    """Vintage analysis configuration (cohort × MOB bad-rate tracking)."""
     dpd_thresholds: List[int] = field(default_factory=lambda: [30, 60, 90])
     reference_cohort_count: int = 4
     deterioration_z_threshold: float = 1.5
@@ -151,7 +151,7 @@ class VintageAnalysisConfig:
 
 @dataclass
 class PortfolioMonitoringConfig:
-    """组合监控配置 — PSI/CSI 和 KPI 追踪"""
+    """Portfolio monitoring configuration — PSI/CSI and KPI tracking."""
     psi_thresholds: Dict[str, float] = field(default_factory=lambda: {
         "stable": 0.10,
         "moderate_shift": 0.25,
