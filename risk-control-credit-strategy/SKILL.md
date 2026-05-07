@@ -1,7 +1,7 @@
 ---
 name: risk-control-credit-strategy
-description: "Use when designing, launching, adjusting, or evaluating credit risk strategies for loan/credit products, especially strategy cold start, credit limit assignment, policy tuning, dynamic account management, and policy effect evaluation. Produces executable operating steps, required data checks, runnable local pipeline commands, and decision-ready risk-control outputs."
-argument-hint: "Describe product stage, customer population, policy objective, available columns, target risk/profit metric, and whether you need cold_start, base_limit, risk_adjustment, dynamic_adjustment, strategy_tuning, causal_evaluation, or full_limit_strategy."
+description: "Use when designing, launching, adjusting, or evaluating credit risk strategies for loan/credit products, especially strategy cold start, credit limit assignment, policy tuning, dynamic account management, champion/challenger simulation, vintage and portfolio monitoring, and policy effect evaluation. Produces executable operating steps, schema-validated runs, structured logs, and decision-ready risk-control outputs."
+argument-hint: "Describe product stage, customer population, policy objective, available columns, target risk/profit metric, and whether you need cold_start, base_limit, risk_adjustment, dynamic_adjustment, strategy_tuning, vintage_analysis, portfolio_monitoring, simulation, causal_evaluation, or full_limit_strategy."
 user-invocable: true
 metadata:
     clawdbot:
@@ -28,6 +28,19 @@ Use this skill when the user asks about:
 - strategy tuning after vintage, delinquency, utilization, approval, or profit movement;
 - evaluation of whether a policy change actually caused risk/profit improvement.
 
+## Architecture
+
+For the canonical module diagram, data-flow between stages, and run-output
+contract, read `ARCHITECTURE.md`. In short:
+
+- **Cross-cutting layer**: `schema.py` (column contracts), `validation.py` (input gating),
+  `logging_utils.py` (structured logs + `run_metadata.json`), `policy_context.py` (shared
+  run state), `policy_versioning.py` (frozen policy snapshots in `policies/`),
+  `simulation.py` (champion/challenger engine), `config.py` (single config tree).
+- **Domain layer**: 7 module scripts wired through `analysis_pipeline.py`.
+- **Output layer**: every run produces `analysis_report.md`, `run_summary.json`,
+  `validation_report.json`, `run_metadata.json`, `pipeline.log`, plus per-mode CSVs.
+
 ## End-to-End Flow
 
 Always run the strategy in this order unless the user explicitly requests a single module:
@@ -39,7 +52,9 @@ Always run the strategy in this order unless the user explicitly requests a sing
 5. **Strategy tuning**: diagnose drift, isolate bad cells, propose minimal policy edits, and define rollout gates. See `strategy-tuning.md`.
 6. **Vintage analysis**: track cohort default curves, detect deteriorating vintages, project mature bad rates. See `vintage-analysis.md`.
 7. **Portfolio monitoring**: detect score PSI/CSI drift and KPI trend alerts. See `portfolio-monitoring.md`.
-8. **Effect evaluation**: evaluate impact with A/B, quasi-experiment, matching, or explicit observational caveats. See `causal-inference.md`.
+8. **Champion / challenger simulation**: score a proposed config vs. current production on the same population (E[Loss], E[Revenue], E[Profit]) before any rollout. See `simulation` mode below.
+9. **Effect evaluation**: evaluate impact with A/B, quasi-experiment, matching, or explicit observational caveats. See `causal-inference.md`.
+10. **Freeze and version**: snapshot the approved policy under `policies/v<n>.json` via `policy_versioning.freeze_policy(...)` for rollback and audit.
 
 ## Module Selection
 
@@ -52,6 +67,7 @@ Always run the strategy in this order unless the user explicitly requests a sing
 | Diagnose bad cells and adjust coefficients | `strategy-tuning.md` | `strategy_tuning` |
 | Track cohort default curves and project mature rates | `vintage-analysis.md` | `vintage_analysis` |
 | Detect score drift (PSI/CSI) and KPI alerts | `portfolio-monitoring.md` | `portfolio_monitoring` |
+| Score a proposed config vs. current production before rollout | `simulation.py` | `simulation` |
 | Prove whether a policy worked | `causal-inference.md` | `causal_evaluation` |
 | Full new-limit workflow from affordability to account action | All limit modules | `full_limit_strategy` |
 
@@ -72,20 +88,30 @@ If data is provided, choose the smallest valid runnable mode and run:
 python3 scripts/analysis_pipeline.py --input-path <data-file> --mode <mode> --output-dir analysis_output
 ```
 
-Optional config override:
+Useful flags:
 
-```bash
-python3 scripts/analysis_pipeline.py --input-path <data-file> --mode <mode> --config-path <config.json> --output-dir analysis_output
-```
+| Flag | Effect |
+|---|---|
+| `--config-path <json>` | Override champion configuration. |
+| `--challenger-config-path <json>` | Required for `simulation` mode. |
+| `--base-period-path <csv>` | Required for `portfolio_monitoring` mode. |
+| `--strict-validation` | Treat range/enum violations as hard errors (default: warn and continue). |
+| `--skip-validation` | Skip schema validation (debug only — never in production runs). |
 
 Then read:
-- `analysis_output/run_summary.json`
-- `analysis_output/analysis_report.md`
+- `analysis_output/run_summary.json` — machine-readable summary including `policy_readiness` and `validation_report`
+- `analysis_output/analysis_report.md` — narrative report
+- `analysis_output/validation_report.json` — per-column diagnostics
+- `analysis_output/run_metadata.json` — run id, status (success/failed), error messages
+- `analysis_output/pipeline.log` — structured log
 - generated step CSV/JSON outputs
 
 Do not invent numeric claims. Use script outputs or clearly label estimates as assumptions.
 
 ## Input Contract
+
+The full per-mode column contract (required, optional, value-range, enum) lives
+in `scripts/schema.py` and is enforced by `scripts/validation.py`. Summary:
 
 | Mode | Required columns | Best optional columns |
 |---|---|---|
@@ -95,6 +121,7 @@ Do not invent numeric claims. Use script outputs or clearly label estimates as a
 | `strategy_tuning` | `customer_id`, `bad_flag` | `risk_level` or `risk_score`, `dti_bin` or `dti`, `final_limit`, `utilization_rate`, `months_on_book`, `channel` |
 | `vintage_analysis` | `customer_id`, `origination_month`, `mob`, `dpd` | `bad_flag`, `loan_amount`, `risk_level`, `channel` |
 | `portfolio_monitoring` | `customer_id`, `score`, `period` (current file) + `--base-period-path` | `bad_flag`, `approved`, `utilization_rate`, feature columns for CSI |
+| `simulation` | `customer_id`, `monthly_income`, `income_source`, `existing_debt`, `tenor_months`, `risk_score`, `dti` | `utilization_rate`, `pd_estimate` |
 | `causal_evaluation` | `customer_id`, `treatment`, `outcome`, `limit_before`, `limit_after` | `risk_score`, `income`, `age`, `dti`, `utilization_rate` |
 | `full_limit_strategy` | base-limit columns | `risk_score`, `dti`, dynamic-management columns |
 
