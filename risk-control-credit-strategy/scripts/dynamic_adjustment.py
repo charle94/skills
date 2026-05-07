@@ -291,6 +291,9 @@ def adjust_single_customer(
 
     el_change = calculate_el_change(current_limit, suggested_limit, pd_estimate)
 
+    # NOTE: do not reintroduce a `suggested_limit = ...` override here for freeze.
+    # The freeze branch above (around line 221) is the single source of truth for
+    # how freeze maps to suggested_limit (see freeze_keeps_current_limit config).
     if adjustment_action == "freeze":
         operational_action = "freeze_usage"
     elif adjustment_action == "decrease":

@@ -259,7 +259,8 @@ def run_full_limit_strategy(df: pd.DataFrame, output_dir: Path, config) -> Tuple
     summary: Dict[str, Any] = {"steps_run": [], "skipped_steps": []}
     report_lines = ["# Full Limit Strategy Analysis", ""]
 
-    ensure_columns(df, MODE_REQUIREMENTS["full_limit_strategy"], "full_limit_strategy")
+    # Schema validation already ran in main() via validation.validate_dataframe;
+    # no redundant column check needed here.
     base_result_df = calculate_batch_limits(df, config=config)
     base_result_df.to_csv(output_dir / "base_limit_results.csv", index=False)
     summary["steps_run"].append("base_limit")
