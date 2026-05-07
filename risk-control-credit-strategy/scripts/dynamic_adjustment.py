@@ -86,47 +86,46 @@ def detect_decrease_signals(
     signals = []
     adjustment_type = "gradual"
     priority = 99
+
+    def mark_freeze(reason: str, new_priority: int) -> None:
+        nonlocal adjustment_type, priority
+        signals.append(reason)
+        adjustment_type = "freeze"
+        priority = min(priority, new_priority)
+
+    def mark_gradual(reason: str, new_priority: int) -> None:
+        nonlocal adjustment_type, priority
+        signals.append(reason)
+        if adjustment_type != "freeze":
+            adjustment_type = "gradual"
+            priority = min(priority, new_priority)
     
     immediate_config = config.dynamic_adjustment.decrease_triggers["immediate"]
     gradual_config = config.dynamic_adjustment.decrease_triggers["gradual"]
     
     if immediate_config.get("fraud_signal") and row.get("fraud_flag", False):
-        signals.append("fraud_signal")
-        adjustment_type = "freeze"
-        priority = 1
+        mark_freeze("fraud_signal", 1)
     
     overdue_status = row.get("overdue_status", "current")
     if immediate_config.get("overdue_m2_plus") and overdue_status in ["m2", "m2_plus"]:
-        signals.append("severe_overdue")
-        adjustment_type = "freeze"
-        priority = 1
+        mark_freeze("severe_overdue", 1)
     
     if gradual_config.get("overdue_m1") and overdue_status == "m1":
-        signals.append("m1_overdue")
-        adjustment_type = "gradual"
-        priority = 2
+        mark_gradual("m1_overdue", 2)
     
     if row.get("external_risk_flag", False):
-        signals.append("external_risk_signal")
-        adjustment_type = "freeze"
-        priority = 1
+        mark_freeze("external_risk_signal", 1)
     
     score_change = row.get("score_change", 0)
     if score_change < 0 and abs(score_change) >= gradual_config["score_drop_threshold"]:
-        signals.append("significant_score_drop")
-        adjustment_type = "gradual"
-        priority = min(priority, 2)
-    
+        mark_gradual("significant_score_drop", 2)
+
     multi_lending = row.get("multi_lending_count", 0)
     if multi_lending >= gradual_config["multi_lending_threshold"]:
-        signals.append("high_multi_lending")
-        adjustment_type = "gradual"
-        priority = min(priority, 3)
+        mark_gradual("high_multi_lending", 3)
     
     if row.get("behavior_change_flag", False):
-        signals.append("behavior_change")
-        adjustment_type = "freeze"
-        priority = min(priority, 2)
+        mark_freeze("behavior_change", 2)
     
     return signals, adjustment_type, priority
 

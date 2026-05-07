@@ -65,13 +65,13 @@ Before giving a recommendation, identify these facts from user input or data:
 If data is provided, choose the smallest valid runnable mode and run:
 
 ```bash
-python scripts/analysis_pipeline.py --input-path <data-file> --mode <mode> --output-dir analysis_output
+python3 scripts/analysis_pipeline.py --input-path <data-file> --mode <mode> --output-dir analysis_output
 ```
 
 Optional config override:
 
 ```bash
-python scripts/analysis_pipeline.py --input-path <data-file> --mode <mode> --config-path <config.json> --output-dir analysis_output
+python3 scripts/analysis_pipeline.py --input-path <data-file> --mode <mode> --config-path <config.json> --output-dir analysis_output
 ```
 
 Then read:

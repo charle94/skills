@@ -72,7 +72,7 @@ Use the strongest valid tier available:
 ## Runnable Command
 
 ```bash
-python scripts/analysis_pipeline.py --input-path <evaluation-data.csv> --mode causal_evaluation --output-dir analysis_output
+python3 scripts/analysis_pipeline.py --input-path <evaluation-data.csv> --mode causal_evaluation --output-dir analysis_output
 ```
 
 Expected outputs:

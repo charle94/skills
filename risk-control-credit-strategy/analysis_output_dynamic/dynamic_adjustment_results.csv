@@ -1,5 +1,0 @@
-customer_id,adjustment_action,adjustment_type,operational_action,trigger_reasons,suggested_limit,adjustment_ratio,expected_el_change,pd_source,priority,current_limit
-C003,decrease,gradual,decrease_limit,"['severe_overdue', 'significant_score_drop', 'high_multi_lending']",17500.0,-0.3,-1260.0,pd_estimate,1,25000
-C002,decrease,gradual,decrease_limit,"['m1_overdue', 'significant_score_drop']",10800.0,-0.4,-518.4,pd_estimate,2,18000
-C001,increase,passive,increase_limit,"['excellent_repayment_history', 'score_improvement', 'high_utilization']",43939.2,0.4646,209.09,pd_estimate,3,30000
-C004,maintain,none,no_change,['frequency_limit_not_reached'],12000.0,0.0,0.0,not_used,99,12000

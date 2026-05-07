@@ -60,7 +60,7 @@ Recommended optional columns:
 ## Runnable Command
 
 ```bash
-python scripts/analysis_pipeline.py --input-path examples/base_limit_sample.csv --mode base_limit --output-dir analysis_output
+python3 scripts/analysis_pipeline.py --input-path examples/base_limit_sample.csv --mode base_limit --output-dir analysis_output
 ```
 
 Expected outputs:

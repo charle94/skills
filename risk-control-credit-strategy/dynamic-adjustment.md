@@ -80,7 +80,7 @@ Increase rules must never override freeze or decrease rules.
 ## Runnable Command
 
 ```bash
-python scripts/analysis_pipeline.py --input-path <dynamic-adjustment-data.csv> --mode dynamic_adjustment --output-dir analysis_output
+python3 scripts/analysis_pipeline.py --input-path <dynamic-adjustment-data.csv> --mode dynamic_adjustment --output-dir analysis_output
 ```
 
 Expected outputs:

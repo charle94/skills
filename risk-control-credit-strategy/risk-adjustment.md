@@ -59,7 +59,7 @@ Recommended optional columns:
 ## Runnable Command
 
 ```bash
-python scripts/analysis_pipeline.py --input-path <risk-adjustment-data.csv> --mode risk_adjustment --output-dir analysis_output
+python3 scripts/analysis_pipeline.py --input-path <risk-adjustment-data.csv> --mode risk_adjustment --output-dir analysis_output
 ```
 
 Expected outputs:
