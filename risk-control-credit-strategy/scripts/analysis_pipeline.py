@@ -21,23 +21,26 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from config import DEFAULT_CONFIG, load_config
-from limit_calculation import REQUIRED_COLUMNS as BASE_LIMIT_COLUMNS
 from limit_calculation import calculate_batch_limits, generate_summary_stats
-from risk_adjustment import REQUIRED_COLUMNS as RISK_ADJUSTMENT_COLUMNS
 from risk_adjustment import adjust_batch_limits, generate_risk_summary, validate_risk_ranking
-from dynamic_adjustment import REQUIRED_COLUMNS as DYNAMIC_COLUMNS
 from dynamic_adjustment import adjust_batch_customers, generate_adjustment_summary
-from causal_inference import REQUIRED_COLUMNS as CAUSAL_COLUMNS
 from causal_inference import generate_evaluation_report, run_causal_analysis
+from strategy_tuning import diagnose_strategy, generate_tuning_report
+from vintage_analysis import generate_vintage_report, run_vintage_analysis
+from portfolio_monitoring import generate_monitoring_report, run_portfolio_monitoring
+from simulation import (
+    StrategyEconomics,
+    generate_simulation_report,
+    run_simulation,
+)
+from schema import get_required_columns, MODE_SCHEMAS
+from validation import validate_dataframe
+from logging_utils import RunMetadata, make_run_id, setup_logger, write_run_metadata
+from policy_context import PolicyRun
 
 
-MODE_REQUIREMENTS = {
-    "base_limit": BASE_LIMIT_COLUMNS,
-    "risk_adjustment": RISK_ADJUSTMENT_COLUMNS,
-    "dynamic_adjustment": DYNAMIC_COLUMNS,
-    "causal_evaluation": CAUSAL_COLUMNS,
-    "full_limit_strategy": BASE_LIMIT_COLUMNS,
-}
+# All modes are registered in schema.MODE_SCHEMAS — derive runtime requirements from there.
+MODE_REQUIREMENTS = {mode: get_required_columns(mode) for mode in MODE_SCHEMAS}
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +54,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default="analysis_output", help="Directory for generated outputs.")
     parser.add_argument("--config-path", help="Optional JSON config override path.")
+    parser.add_argument(
+        "--base-period-path",
+        help="Reference/base period data for portfolio_monitoring PSI/CSI comparison.",
+    )
+    parser.add_argument(
+        "--challenger-config-path",
+        help="Required for `simulation` mode: JSON path defining the challenger policy.",
+    )
+    parser.add_argument(
+        "--strict-validation",
+        action="store_true",
+        help="Treat range/enum violations as hard errors (default is to warn and continue).",
+    )
+    parser.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help="Skip schema validation entirely (not recommended; use only for debugging).",
+    )
     return parser.parse_args()
 
 
@@ -124,6 +145,33 @@ def determine_policy_readiness(mode: str, summary: Dict[str, Any]) -> Tuple[str,
         if evidence_tier != "causal_psm_ready":
             status = "partial"
             reasons.append(f"causal_design_is_not_fully_credible:{evidence_tier}")
+    elif mode == "strategy_tuning":
+        if summary.get("over_target_cells", 0) > 0 and summary.get("high_confidence_over_target", 0) > 0:
+            status = "partial"
+            reasons.append("high_confidence_cells_over_target_require_tightening")
+        if summary.get("insufficient_data_cells", 0) > 0:
+            if status == "ready":
+                status = "partial"
+            reasons.append("some_cells_have_insufficient_data_for_reliable_recommendations")
+    elif mode == "vintage_analysis":
+        if summary.get("deteriorating_cohorts", 0) > 0:
+            status = "partial"
+            reasons.append(f"deteriorating_cohorts_detected:{summary['deteriorating_cohorts']}")
+    elif mode == "portfolio_monitoring":
+        if summary.get("high_severity_alerts", 0) > 0:
+            status = "blocked"
+            reasons.append(f"high_severity_kpi_alerts:{summary['high_severity_alerts']}")
+        elif summary.get("total_alerts", 0) > 0 or summary.get("psi_stability") in ("moderate_shift", "significant_shift"):
+            status = "partial"
+            reasons.append("score_distribution_or_kpi_shift_detected")
+    elif mode == "simulation":
+        decision = summary.get("decision", {}).get("recommendation", "")
+        if decision == "reject":
+            status = "blocked"
+            reasons.extend(summary.get("decision", {}).get("reasons", []))
+        elif decision == "investigate":
+            status = "partial"
+            reasons.extend(summary.get("decision", {}).get("reasons", []))
     elif mode == "full_limit_strategy":
         if summary.get("skipped_steps"):
             status = "partial"
@@ -211,7 +259,8 @@ def run_full_limit_strategy(df: pd.DataFrame, output_dir: Path, config) -> Tuple
     summary: Dict[str, Any] = {"steps_run": [], "skipped_steps": []}
     report_lines = ["# Full Limit Strategy Analysis", ""]
 
-    ensure_columns(df, BASE_LIMIT_COLUMNS, "full_limit_strategy")
+    # Schema validation already ran in main() via validation.validate_dataframe;
+    # no redundant column check needed here.
     base_result_df = calculate_batch_limits(df, config=config)
     base_result_df.to_csv(output_dir / "base_limit_results.csv", index=False)
     summary["steps_run"].append("base_limit")
@@ -268,47 +317,183 @@ def run_full_limit_strategy(df: pd.DataFrame, output_dir: Path, config) -> Tuple
     return summary, report_lines
 
 
+def run_strategy_tuning(df: pd.DataFrame, output_dir: Path, config) -> Tuple[Dict[str, Any], List[str]]:
+    cell_df, summary = diagnose_strategy(df, config=config)
+    cell_df.to_csv(output_dir / "strategy_tuning_results.csv", index=False)
+    report_lines = generate_tuning_report(cell_df, summary)
+    return summary, report_lines
+
+
+def run_vintage_analysis_mode(df: pd.DataFrame, output_dir: Path, config) -> Tuple[Dict[str, Any], List[str]]:
+    bad_rate_matrix, z_matrix, projection_df, count_matrix, summary = run_vintage_analysis(df, config=config)
+    bad_rate_matrix.to_csv(output_dir / "vintage_bad_rate_matrix.csv")
+    z_matrix.to_csv(output_dir / "vintage_z_score_matrix.csv")
+    projection_df.to_csv(output_dir / "vintage_projection.csv", index=False)
+    count_matrix.to_csv(output_dir / "vintage_count_matrix.csv")
+    from vintage_analysis import generate_vintage_report as _gen
+    report_lines = _gen(bad_rate_matrix, z_matrix, projection_df, summary)
+    return summary, report_lines
+
+
+def run_portfolio_monitoring_mode(
+    df: pd.DataFrame,
+    base_df: pd.DataFrame,
+    output_dir: Path,
+    config,
+) -> Tuple[Dict[str, Any], List[str]]:
+    feature_cols = [c for c in df.columns if c not in ("customer_id", "score", "period", "bad_flag")]
+    psi_score, psi_detail_df, csi_df, trend_df, alerts, summary = run_portfolio_monitoring(
+        base_df, df, feature_cols=feature_cols if feature_cols else None, config=config
+    )
+    if len(psi_detail_df):
+        psi_detail_df.to_csv(output_dir / "psi_detail.csv", index=False)
+    if len(csi_df):
+        csi_df.to_csv(output_dir / "csi_results.csv", index=False)
+    if len(trend_df):
+        trend_df.to_csv(output_dir / "kpi_trends.csv", index=False)
+    report_lines = generate_monitoring_report(psi_score, psi_detail_df, csi_df, trend_df, alerts, summary, config)
+    return summary, report_lines
+
+
+def run_simulation_mode(
+    df: pd.DataFrame,
+    challenger_config_path: str | None,
+    output_dir: Path,
+    champion_config,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Run a champion vs. challenger simulation on the same population."""
+    if not challenger_config_path:
+        raise ValueError(
+            "simulation mode requires --challenger-config-path pointing to the proposed policy JSON."
+        )
+    challenger_config = load_config(challenger_config_path)
+
+    champion_metrics, challenger_metrics, side_by_side, summary = run_simulation(
+        df,
+        champion_config=champion_config,
+        challenger_config=challenger_config,
+        economics=StrategyEconomics(),
+    )
+
+    side_by_side.to_csv(output_dir / "simulation_side_by_side.csv", index=False)
+    report_lines = generate_simulation_report(summary)
+    return summary, report_lines
+
+
 def main() -> None:
     args = parse_args()
     input_path = Path(args.input_path)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    config = load_config(args.config_path) if args.config_path else DEFAULT_CONFIG
-    df = read_dataframe(input_path)
+    run_id = make_run_id(args.mode, str(input_path))
+    logger = setup_logger("credit_strategy", output_dir)
+    metadata = RunMetadata(
+        run_id=run_id,
+        mode=args.mode,
+        input_path=str(input_path),
+        output_dir=str(output_dir),
+        config_path=args.config_path,
+        started_at=__import__("datetime").datetime.now().isoformat(),
+    )
 
-    ensure_columns(df, MODE_REQUIREMENTS[args.mode], args.mode)
+    try:
+        logger.info(f"run_id={run_id} mode={args.mode} input={input_path}")
 
-    if args.mode == "base_limit":
-        summary, report_lines = run_base_limit(df, output_dir, config)
-    elif args.mode == "risk_adjustment":
-        summary, report_lines = run_risk_adjustment(df, output_dir, config)
-    elif args.mode == "dynamic_adjustment":
-        summary, report_lines = run_dynamic_adjustment(df, output_dir, config)
-    elif args.mode == "causal_evaluation":
-        summary, report_lines = run_causal_evaluation(df, output_dir, config)
-    else:
-        summary, report_lines = run_full_limit_strategy(df, output_dir, config)
+        config = load_config(args.config_path) if args.config_path else DEFAULT_CONFIG
+        df = read_dataframe(input_path)
+        logger.info(f"loaded input rows={len(df)} columns={list(df.columns)}")
 
-    run_summary = {
-        "mode": args.mode,
-        "input_path": str(input_path),
-        "output_dir": str(output_dir),
-        "row_count": int(len(df)),
-        "columns": list(df.columns),
-        "summary": summary,
-    }
-    readiness_status, readiness_reasons = determine_policy_readiness(args.mode, summary)
-    run_summary["policy_readiness"] = readiness_status
-    run_summary["readiness_reasons"] = readiness_reasons
-    report_lines.extend([
-        "",
-        "# Policy Readiness",
-        f"Status: {readiness_status}",
-        f"Reasons: {readiness_reasons}",
-    ])
-    write_json(output_dir / "run_summary.json", run_summary)
-    write_report(output_dir / "analysis_report.md", report_lines)
+        # Schema validation (always on unless --skip-validation)
+        validation_report_dict: Dict[str, Any] | None = None
+        if not args.skip_validation:
+            report = validate_dataframe(df, args.mode, strict=args.strict_validation)
+            validation_report_dict = report.to_dict()
+            (output_dir / "validation_report.json").write_text(
+                json.dumps(validation_report_dict, indent=2, ensure_ascii=True),
+                encoding="utf-8",
+            )
+            for warning in report.warnings:
+                logger.warning(f"validation: {warning}")
+            if not report.is_valid:
+                for err in report.errors:
+                    logger.error(f"validation: {err}")
+                joined = "\n  - ".join(report.errors)
+                raise ValueError(
+                    f"Input validation failed for mode '{args.mode}':\n  - {joined}"
+                )
+            logger.info(
+                f"validation passed: {len(report.warnings)} warnings, "
+                f"{len(report.column_diagnostics)} columns inspected"
+            )
+        else:
+            logger.warning("schema validation skipped via --skip-validation")
+            ensure_columns(df, MODE_REQUIREMENTS[args.mode], args.mode)
+
+        if args.mode == "base_limit":
+            summary, report_lines = run_base_limit(df, output_dir, config)
+        elif args.mode == "risk_adjustment":
+            summary, report_lines = run_risk_adjustment(df, output_dir, config)
+        elif args.mode == "dynamic_adjustment":
+            summary, report_lines = run_dynamic_adjustment(df, output_dir, config)
+        elif args.mode == "causal_evaluation":
+            summary, report_lines = run_causal_evaluation(df, output_dir, config)
+        elif args.mode == "strategy_tuning":
+            summary, report_lines = run_strategy_tuning(df, output_dir, config)
+        elif args.mode == "vintage_analysis":
+            summary, report_lines = run_vintage_analysis_mode(df, output_dir, config)
+        elif args.mode == "portfolio_monitoring":
+            base_path = getattr(args, "base_period_path", None)
+            if not base_path:
+                raise ValueError("portfolio_monitoring requires --base-period-path for the reference period data.")
+            base_df = read_dataframe(Path(base_path))
+            logger.info(f"loaded base-period rows={len(base_df)}")
+            summary, report_lines = run_portfolio_monitoring_mode(df, base_df, output_dir, config)
+        elif args.mode == "simulation":
+            summary, report_lines = run_simulation_mode(
+                df, args.challenger_config_path, output_dir, config
+            )
+        else:
+            summary, report_lines = run_full_limit_strategy(df, output_dir, config)
+
+        run_summary = {
+            "run_id": run_id,
+            "mode": args.mode,
+            "input_path": str(input_path),
+            "output_dir": str(output_dir),
+            "row_count": int(len(df)),
+            "columns": list(df.columns),
+            "summary": summary,
+            "validation_report": validation_report_dict,
+        }
+        readiness_status, readiness_reasons = determine_policy_readiness(args.mode, summary)
+        run_summary["policy_readiness"] = readiness_status
+        run_summary["readiness_reasons"] = readiness_reasons
+        report_lines.extend([
+            "",
+            "# Policy Readiness",
+            f"Status: {readiness_status}",
+            f"Reasons: {readiness_reasons}",
+        ])
+        write_json(output_dir / "run_summary.json", run_summary)
+        write_report(output_dir / "analysis_report.md", report_lines)
+
+        metadata.status = "success"
+        metadata.finished_at = __import__("datetime").datetime.now().isoformat()
+        metadata.extras["readiness_status"] = readiness_status
+        metadata.extras["readiness_reasons"] = readiness_reasons
+        write_run_metadata(output_dir, metadata)
+        logger.info(
+            f"run completed: readiness={readiness_status} reasons={readiness_reasons}"
+        )
+
+    except Exception as exc:
+        metadata.status = "failed"
+        metadata.finished_at = __import__("datetime").datetime.now().isoformat()
+        metadata.error_message = str(exc)
+        write_run_metadata(output_dir, metadata)
+        logger.exception(f"run failed: {exc}")
+        raise
 
 
 if __name__ == "__main__":

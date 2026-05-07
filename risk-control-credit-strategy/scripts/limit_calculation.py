@@ -153,16 +153,13 @@ def calculate_batch_limits(
     """Calculate base limits for a dataframe of applicants or accounts."""
     if config is None:
         config = DEFAULT_CONFIG
-    
+
     missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
     if missing_cols:
         raise ValueError(f"Missing required columns for base limit calculation: {missing_cols}")
-    
-    results = []
-    
-    for _, row in df.iterrows():
+
+    def _apply_row(row: pd.Series) -> pd.Series:
         dti_level = row.get(dti_level_col, config.dti.default_dti_level)
-        
         result = calculate_single_limit(
             customer_id=row["customer_id"],
             monthly_income=row["monthly_income"],
@@ -170,28 +167,25 @@ def calculate_batch_limits(
             existing_debt=row["existing_debt"],
             tenor_months=row["tenor_months"],
             dti_level=dti_level,
-            config=config
+            config=config,
         )
-        results.append(result)
-    
-    output_df = pd.DataFrame([
-        {
-            "customer_id": r.customer_id,
-            "verified_income": r.verified_income,
-            "income_haircut": r.income_haircut,
-            "dti_threshold": r.dti_threshold,
-            "max_monthly_repayment": r.max_monthly_repayment,
-            "available_capacity": r.available_capacity,
-            "tenor_factor": r.tenor_factor,
-            "base_limit": r.base_limit,
-            "affordability_status": r.affordability_status,
-            "floor_eligible": r.floor_eligible,
-            "warnings": r.warnings
-        }
-        for r in results
-    ])
-    
-    return output_df
+        return pd.Series(
+            {
+                "customer_id": result.customer_id,
+                "verified_income": result.verified_income,
+                "income_haircut": result.income_haircut,
+                "dti_threshold": result.dti_threshold,
+                "max_monthly_repayment": result.max_monthly_repayment,
+                "available_capacity": result.available_capacity,
+                "tenor_factor": result.tenor_factor,
+                "base_limit": result.base_limit,
+                "affordability_status": result.affordability_status,
+                "floor_eligible": result.floor_eligible,
+                "warnings": result.warnings,
+            }
+        )
+
+    return df.apply(_apply_row, axis=1).reset_index(drop=True)
 
 
 def generate_summary_stats(result_df: pd.DataFrame) -> Dict:

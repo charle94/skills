@@ -219,8 +219,14 @@ def adjust_single_customer(
             current_limit, decrease_signals, decrease_type, config
         )
         if adjustment_action == "freeze":
-            suggested_limit = 0.0
-            adjustment_ratio = -1.0
+            # freeze_keeps_current_limit controls whether the recorded limit stays
+            # at the current value (operational block only) or drops to zero.
+            if config.dynamic_adjustment.freeze_keeps_current_limit:
+                suggested_limit = current_limit
+                adjustment_ratio = 0.0
+            else:
+                suggested_limit = 0.0
+                adjustment_ratio = -1.0
         else:
             suggested_limit = max(current_limit - adjustment_amount, 0.0)
             adjustment_ratio = -adjustment_amount / current_limit if current_limit else 0.0
@@ -283,12 +289,11 @@ def adjust_single_customer(
 
     pd_estimate = max(0.01, min(0.95, pd_estimate))
 
-    if adjustment_action == "freeze" and config.dynamic_adjustment.freeze_keeps_current_limit:
-        suggested_limit = current_limit
-        adjustment_ratio = 0.0
-
     el_change = calculate_el_change(current_limit, suggested_limit, pd_estimate)
 
+    # NOTE: do not reintroduce a `suggested_limit = ...` override here for freeze.
+    # The freeze branch above (around line 221) is the single source of truth for
+    # how freeze maps to suggested_limit (see freeze_keeps_current_limit config).
     if adjustment_action == "freeze":
         operational_action = "freeze_usage"
     elif adjustment_action == "decrease":

@@ -64,7 +64,47 @@ Recommended inputs:
    - Use `causal-inference.md` if treatment/control data exists.
    - Decide: scale, keep testing, narrow, or roll back.
 
-## Tuning Output Template
+## Runnable Command
+
+```bash
+python3 scripts/analysis_pipeline.py --input-path examples/strategy_tuning_sample.csv --mode strategy_tuning --output-dir analysis_output
+```
+
+Expected outputs:
+- `strategy_tuning_results.csv`
+- `run_summary.json`
+- `analysis_report.md`
+
+## Output Fields to Use
+
+- `risk_level`, `dti_bin`, `channel`, `income_source` (segment identifiers from input)
+- `customer_count`
+- `bad_count`
+- `observed_bad_rate`
+- `target_bad_rate`
+- `bad_rate_deviation_pct`
+- `expected_loss_per_customer`
+- `total_expected_loss`
+- `status` (`over_target`, `on_target`, `under_target`, `insufficient_data`)
+- `recommended_action` (`tighten`, `hold`, `relax`, `monitor`)
+- `recommended_coefficient_factor` (multiply current coefficient by this value)
+- `confidence` (`high`, `medium`, `low`)
+- `estimated_el_reduction`
+
+## Required Input Columns
+
+Minimum:
+- `customer_id`
+- `bad_flag` (0/1 default indicator)
+
+Strongly recommended for useful segmentation:
+- `risk_level` or `risk_score`
+- `dti_bin` or `dti`
+- `final_limit` or `current_limit`
+- `utilization_rate`
+- `months_on_book` (used for maturity filter — immature accounts excluded by default)
+
+
 
 Produce these sections:
 
