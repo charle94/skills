@@ -1,0 +1,57 @@
+{
+  "mode": "dynamic_adjustment",
+  "input_path": "examples/dynamic_adjustment_sample.csv",
+  "output_dir": "analysis_output_dynamic",
+  "row_count": 4,
+  "columns": [
+    "customer_id",
+    "current_limit",
+    "behavior_score",
+    "repayment_months",
+    "overdue_status",
+    "utilization_rate",
+    "external_risk_flag",
+    "last_increase_months",
+    "score_change",
+    "multi_lending_count",
+    "behavior_change_flag",
+    "fraud_flag",
+    "pd_estimate",
+    "user_request"
+  ],
+  "summary": {
+    "total_customers": 4,
+    "action_distribution": {
+      "decrease": 2,
+      "increase": 1,
+      "maintain": 1
+    },
+    "operational_action_distribution": {
+      "decrease_limit": 2,
+      "increase_limit": 1,
+      "no_change": 1
+    },
+    "type_distribution": {
+      "gradual": 2,
+      "passive": 1
+    },
+    "increase_stats": {
+      "count": 1,
+      "avg_ratio": 0.4646,
+      "total_limit_increase": 13939.2
+    },
+    "decrease_stats": {
+      "count": 2,
+      "avg_ratio": -0.35,
+      "total_limit_decrease": 14700.0
+    },
+    "freeze_stats": {
+      "count": 0
+    },
+    "total_expected_el_change": -1569.31,
+    "heuristic_pd_count": 0,
+    "high_priority_count": 2
+  },
+  "policy_readiness": "ready",
+  "readiness_reasons": []
+}

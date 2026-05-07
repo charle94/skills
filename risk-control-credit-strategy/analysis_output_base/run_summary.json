@@ -1,0 +1,35 @@
+{
+  "mode": "base_limit",
+  "input_path": "examples/base_limit_sample.csv",
+  "output_dir": "analysis_output_base",
+  "row_count": 3,
+  "columns": [
+    "customer_id",
+    "monthly_income",
+    "income_source",
+    "existing_debt",
+    "tenor_months",
+    "dti_level"
+  ],
+  "summary": {
+    "total_customers": 3,
+    "avg_base_limit": 45333.33,
+    "median_base_limit": 36000.0,
+    "min_base_limit": 0.0,
+    "max_base_limit": 100000.0,
+    "avg_verified_income": 8666.67,
+    "avg_available_capacity": 2800.0,
+    "zero_capacity_count": 1,
+    "affordability_distribution": {
+      "affordable": 2,
+      "not_affordable": 1
+    },
+    "floor_eligible_count": 2,
+    "warning_count": 1
+  },
+  "policy_readiness": "partial",
+  "readiness_reasons": [
+    "some_accounts_have_no_affordability_and_should_not_receive_floor_protection",
+    "input_or_income_quality_warnings_present"
+  ]
+}

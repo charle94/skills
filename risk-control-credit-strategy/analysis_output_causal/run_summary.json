@@ -1,0 +1,96 @@
+{
+  "mode": "causal_evaluation",
+  "input_path": "examples/causal_evaluation_sample.csv",
+  "output_dir": "analysis_output_causal",
+  "row_count": 8,
+  "columns": [
+    "customer_id",
+    "treatment",
+    "outcome",
+    "limit_before",
+    "limit_after",
+    "risk_score",
+    "income",
+    "age",
+    "dti",
+    "utilization_rate"
+  ],
+  "summary": {
+    "ate": 0.0,
+    "att": 0.0,
+    "lift": 1.0,
+    "ks_statistic": 0.0,
+    "ks_pvalue": 1.0,
+    "confidence_interval_95": [
+      -0.5,
+      0.5
+    ],
+    "sample_sizes": {
+      "total": 8,
+      "treated": 4,
+      "control": 4
+    },
+    "default_rates": {
+      "treated_rate": 0.25,
+      "control_rate": 0.25
+    },
+    "profit_simulation": {
+      "treated_before": {
+        "total_profit": -1500.0,
+        "avg_profit": -375.0,
+        "total_expected_loss": 11250.0,
+        "avg_limit": 18750.0,
+        "default_rate": 0.25
+      },
+      "treated_after": {
+        "total_profit": -2000.0,
+        "avg_profit": -500.0,
+        "total_expected_loss": 15000.0,
+        "avg_limit": 25000.0,
+        "default_rate": 0.25
+      },
+      "control": {
+        "total_profit": -1500.0,
+        "avg_profit": -375.0,
+        "total_expected_loss": 11250.0,
+        "avg_limit": 18750.0,
+        "default_rate": 0.25
+      },
+      "marginal_profit": -125.0,
+      "profit_per_treated_customer": -500.0,
+      "psm_matching_stats": {
+        "total_treated": 4,
+        "matched_treated": 0,
+        "unmatched_treated": 4,
+        "matching_rate": 0.0,
+        "avg_propensity_diff": 0,
+        "matched_control_count": 0,
+        "control_reuse_rate": 0.0,
+        "treated_in_support_rate": 0.0,
+        "common_support_lower": 0.4896,
+        "common_support_upper": 0.4179
+      }
+    },
+    "balance_diagnostics": {
+      "pre_match": {
+        "smd_risk_score": 0.1952,
+        "smd_income": 0.034,
+        "smd_age": -0.1925,
+        "smd_dti": -0.0681,
+        "smd_utilization_rate": 0.9188,
+        "max_abs_smd": 0.9188
+      },
+      "post_match": {}
+    },
+    "overlap_diagnostics": {
+      "treated_in_support_rate": 0.0,
+      "common_support_lower": 0.4896,
+      "common_support_upper": 0.4179
+    },
+    "evidence_tier": "causal_psm_weak_overlap"
+  },
+  "policy_readiness": "partial",
+  "readiness_reasons": [
+    "causal_design_is_not_fully_credible:causal_psm_weak_overlap"
+  ]
+}

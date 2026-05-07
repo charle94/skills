@@ -1,0 +1,5 @@
+customer_id,risk_level,dti_bin,risk_coefficient,adjusted_limit,floor_limit,cap_limit,final_limit,affordability_status,floor_eligible,applied_constraint
+C001,very_low_risk,dti_medium,3.0,108000.0,3000,110000,108000.0,affordable,True,
+C002,medium_risk,dti_high,1.5,18000.0,3000,80000,18000.0,constrained,True,
+C003,very_low_risk,dti_low,4.0,0.0,3000,110000,0.0,not_affordable,False,affordability_block
+C004,medium_risk,dti_very_high,0.8,12000.0,3000,80000,12000.0,affordable,True,

@@ -1,0 +1,4 @@
+customer_id,monthly_income,income_source,existing_debt,tenor_months,dti_level
+C001,10000,payroll,2000,12,moderate
+C002,8000,self_reported,3500,24,conservative
+C003,15000,bank_flow,3000,36,aggressive

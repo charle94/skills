@@ -1,0 +1,60 @@
+{
+  "mode": "risk_adjustment",
+  "input_path": "examples/risk_adjustment_sample.csv",
+  "output_dir": "analysis_output_risk",
+  "row_count": 4,
+  "columns": [
+    "customer_id",
+    "base_limit",
+    "risk_score",
+    "dti",
+    "affordability_status",
+    "floor_eligible"
+  ],
+  "summary": {
+    "summary": {
+      "total_customers": 4,
+      "avg_final_limit": 34500.0,
+      "median_final_limit": 15000.0,
+      "risk_level_distribution": {
+        "very_low_risk": 2,
+        "medium_risk": 2
+      },
+      "dti_bin_distribution": {
+        "dti_medium": 1,
+        "dti_high": 1,
+        "dti_low": 1,
+        "dti_very_high": 1
+      },
+      "constraint_distribution": {
+        "None": 3,
+        "affordability_block": 1
+      },
+      "avg_coefficient_by_risk": {
+        "medium_risk": 1.15,
+        "very_low_risk": 3.5
+      },
+      "affordability_distribution": {
+        "affordable": 2,
+        "constrained": 1,
+        "not_affordable": 1
+      },
+      "floor_block_count": 1
+    },
+    "validation": {
+      "correlation_risk_limit": 0.3708,
+      "is_correct_ranking": true,
+      "avg_limit_by_risk_level": {
+        "medium_risk": 15000.0,
+        "very_low_risk": 54000.0
+      },
+      "floor_hit_rate": 0.0,
+      "cap_hit_rate": 0.0,
+      "validation_passed": true
+    }
+  },
+  "policy_readiness": "partial",
+  "readiness_reasons": [
+    "floor_application_was_blocked_for_non_affordable_accounts"
+  ]
+}

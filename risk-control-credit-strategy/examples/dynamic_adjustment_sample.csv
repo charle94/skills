@@ -1,0 +1,5 @@
+customer_id,current_limit,behavior_score,repayment_months,overdue_status,utilization_rate,external_risk_flag,last_increase_months,score_change,multi_lending_count,behavior_change_flag,fraud_flag,pd_estimate,user_request
+C001,30000,88,8,current,0.86,False,8,25,1,False,False,0.025,False
+C002,18000,52,3,m1,0.42,False,12,-35,4,False,False,0.120,False
+C003,25000,40,2,m2_plus,0.30,False,12,-50,6,False,False,0.280,False
+C004,12000,72,10,current,0.91,False,2,18,1,False,False,0.040,True

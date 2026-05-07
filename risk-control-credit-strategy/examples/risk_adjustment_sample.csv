@@ -1,0 +1,5 @@
+customer_id,base_limit,risk_score,dti,affordability_status,floor_eligible
+C001,36000,85,0.15,affordable,True
+C002,12000,45,0.35,constrained,True
+C003,0,92,0.08,not_affordable,False
+C004,15000,25,0.55,affordable,True
