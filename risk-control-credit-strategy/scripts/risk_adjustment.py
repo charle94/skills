@@ -175,22 +175,18 @@ def adjust_batch_limits(
     """Apply the risk policy to a dataframe of base limits."""
     if config is None:
         config = DEFAULT_CONFIG
-    
+
     required_cols = ["customer_id", base_limit_col, risk_score_col, dti_col]
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
         raise ValueError(f"Missing required columns for risk adjustment: {missing_cols}")
-    
-    results = []
-    
-    for _, row in df.iterrows():
+
+    def _apply_row(row: pd.Series) -> pd.Series:
         risk_level = None
         if risk_level_col and risk_level_col in row.index and pd.notna(row[risk_level_col]):
             risk_level = row[risk_level_col]
-
         affordability_status = row["affordability_status"] if "affordability_status" in row.index else None
         floor_eligible = row["floor_eligible"] if "floor_eligible" in row.index else None
-        
         result = adjust_single_limit(
             customer_id=row["customer_id"],
             base_limit=row[base_limit_col],
@@ -199,28 +195,25 @@ def adjust_batch_limits(
             risk_level=risk_level,
             affordability_status=affordability_status,
             floor_eligible=floor_eligible,
-            config=config
+            config=config,
         )
-        results.append(result)
-    
-    output_df = pd.DataFrame([
-        {
-            "customer_id": r.customer_id,
-            "risk_level": r.risk_level,
-            "dti_bin": r.dti_bin,
-            "risk_coefficient": r.risk_coefficient,
-            "adjusted_limit": r.adjusted_limit,
-            "floor_limit": r.floor_limit,
-            "cap_limit": r.cap_limit,
-            "final_limit": r.final_limit,
-            "affordability_status": r.affordability_status,
-            "floor_eligible": r.floor_eligible,
-            "applied_constraint": r.applied_constraint
-        }
-        for r in results
-    ])
-    
-    return output_df
+        return pd.Series(
+            {
+                "customer_id": result.customer_id,
+                "risk_level": result.risk_level,
+                "dti_bin": result.dti_bin,
+                "risk_coefficient": result.risk_coefficient,
+                "adjusted_limit": result.adjusted_limit,
+                "floor_limit": result.floor_limit,
+                "cap_limit": result.cap_limit,
+                "final_limit": result.final_limit,
+                "affordability_status": result.affordability_status,
+                "floor_eligible": result.floor_eligible,
+                "applied_constraint": result.applied_constraint,
+            }
+        )
+
+    return df.apply(_apply_row, axis=1).reset_index(drop=True)
 
 
 def generate_risk_summary(result_df: pd.DataFrame) -> Dict:

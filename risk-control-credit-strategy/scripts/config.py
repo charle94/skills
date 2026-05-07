@@ -123,6 +123,52 @@ class CausalInferenceConfig:
 
 
 @dataclass
+class StrategyTuningConfig:
+    """策略调优配置"""
+    target_bad_rates: Dict[str, float] = field(default_factory=lambda: {
+        "very_low_risk": 0.02,
+        "low_risk": 0.05,
+        "medium_risk": 0.10,
+        "high_risk": 0.18,
+    })
+    deviation_threshold: float = 0.20
+    min_cell_observations: int = 30
+    lgd: float = 0.60
+    mob_min_for_maturity: int = 6
+    max_relax_factor: float = 1.30
+    min_tighten_factor: float = 0.50
+
+
+@dataclass
+class VintageAnalysisConfig:
+    """老贷款批次（Vintage）分析配置"""
+    dpd_thresholds: List[int] = field(default_factory=lambda: [30, 60, 90])
+    reference_cohort_count: int = 4
+    deterioration_z_threshold: float = 1.5
+    min_cohort_observations: int = 20
+    maturation_mob_targets: List[int] = field(default_factory=lambda: [3, 6, 12, 18, 24])
+
+
+@dataclass
+class PortfolioMonitoringConfig:
+    """组合监控配置 — PSI/CSI 和 KPI 追踪"""
+    psi_thresholds: Dict[str, float] = field(default_factory=lambda: {
+        "stable": 0.10,
+        "moderate_shift": 0.25,
+    })
+    psi_bins: int = 10
+    csi_thresholds: Dict[str, float] = field(default_factory=lambda: {
+        "stable": 0.10,
+        "moderate_shift": 0.25,
+    })
+    kpi_alert_rules: Dict[str, Dict] = field(default_factory=lambda: {
+        "bad_rate": {"relative_increase_pct": 20.0, "absolute_increase": 0.02},
+        "approval_rate": {"relative_decrease_pct": 10.0},
+        "utilization_rate": {"absolute_increase": 0.10},
+    })
+
+
+@dataclass
 class CreditLimitConfig:
     """Top-level configuration object for all strategy modules."""
     income_verification: IncomeVerificationConfig = field(default_factory=IncomeVerificationConfig)
@@ -132,52 +178,37 @@ class CreditLimitConfig:
     floor_cap: FloorCapConfig = field(default_factory=FloorCapConfig)
     dynamic_adjustment: DynamicAdjustmentConfig = field(default_factory=DynamicAdjustmentConfig)
     causal_inference: CausalInferenceConfig = field(default_factory=CausalInferenceConfig)
-    
+    strategy_tuning: StrategyTuningConfig = field(default_factory=StrategyTuningConfig)
+    vintage_analysis: VintageAnalysisConfig = field(default_factory=VintageAnalysisConfig)
+    portfolio_monitoring: PortfolioMonitoringConfig = field(default_factory=PortfolioMonitoringConfig)
+
     product_cap: float = 100000.0
-    
+
+    _SECTION_CLASSES = {
+        "income_verification": "income_verification",
+        "dti": "dti",
+        "tenor_factor": "tenor_factor",
+        "risk_coefficient": "risk_coefficient",
+        "floor_cap": "floor_cap",
+        "dynamic_adjustment": "dynamic_adjustment",
+        "causal_inference": "causal_inference",
+        "strategy_tuning": "strategy_tuning",
+        "vintage_analysis": "vintage_analysis",
+        "portfolio_monitoring": "portfolio_monitoring",
+    }
+
     @classmethod
     def from_dict(cls, config_dict: Dict) -> "CreditLimitConfig":
         """Create a config object from nested dict overrides."""
         config = cls()
-        
-        if "income_verification" in config_dict:
-            for k, v in config_dict["income_verification"].items():
-                if hasattr(config.income_verification, k):
-                    setattr(config.income_verification, k, v)
-        
-        if "dti" in config_dict:
-            for k, v in config_dict["dti"].items():
-                if hasattr(config.dti, k):
-                    setattr(config.dti, k, v)
-        
-        if "tenor_factor" in config_dict:
-            for k, v in config_dict["tenor_factor"].items():
-                if hasattr(config.tenor_factor, k):
-                    setattr(config.tenor_factor, k, v)
-        
-        if "risk_coefficient" in config_dict:
-            for k, v in config_dict["risk_coefficient"].items():
-                if hasattr(config.risk_coefficient, k):
-                    setattr(config.risk_coefficient, k, v)
-        
-        if "floor_cap" in config_dict:
-            for k, v in config_dict["floor_cap"].items():
-                if hasattr(config.floor_cap, k):
-                    setattr(config.floor_cap, k, v)
-        
-        if "dynamic_adjustment" in config_dict:
-            for k, v in config_dict["dynamic_adjustment"].items():
-                if hasattr(config.dynamic_adjustment, k):
-                    setattr(config.dynamic_adjustment, k, v)
-        
-        if "causal_inference" in config_dict:
-            for k, v in config_dict["causal_inference"].items():
-                if hasattr(config.causal_inference, k):
-                    setattr(config.causal_inference, k, v)
-        
+        for section_key in cls._SECTION_CLASSES:
+            if section_key in config_dict:
+                section_obj = getattr(config, section_key)
+                for k, v in config_dict[section_key].items():
+                    if hasattr(section_obj, k):
+                        setattr(section_obj, k, v)
         if "product_cap" in config_dict:
             config.product_cap = config_dict["product_cap"]
-        
         return config
     
     def to_dict(self) -> Dict:

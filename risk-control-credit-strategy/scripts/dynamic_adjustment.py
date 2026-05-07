@@ -219,8 +219,14 @@ def adjust_single_customer(
             current_limit, decrease_signals, decrease_type, config
         )
         if adjustment_action == "freeze":
-            suggested_limit = 0.0
-            adjustment_ratio = -1.0
+            # freeze_keeps_current_limit controls whether the recorded limit stays
+            # at the current value (operational block only) or drops to zero.
+            if config.dynamic_adjustment.freeze_keeps_current_limit:
+                suggested_limit = current_limit
+                adjustment_ratio = 0.0
+            else:
+                suggested_limit = 0.0
+                adjustment_ratio = -1.0
         else:
             suggested_limit = max(current_limit - adjustment_amount, 0.0)
             adjustment_ratio = -adjustment_amount / current_limit if current_limit else 0.0
@@ -282,10 +288,6 @@ def adjust_single_customer(
         pd_source = "heuristic_behavior_score"
 
     pd_estimate = max(0.01, min(0.95, pd_estimate))
-
-    if adjustment_action == "freeze" and config.dynamic_adjustment.freeze_keeps_current_limit:
-        suggested_limit = current_limit
-        adjustment_ratio = 0.0
 
     el_change = calculate_el_change(current_limit, suggested_limit, pd_estimate)
 

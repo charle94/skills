@@ -29,6 +29,12 @@ from dynamic_adjustment import REQUIRED_COLUMNS as DYNAMIC_COLUMNS
 from dynamic_adjustment import adjust_batch_customers, generate_adjustment_summary
 from causal_inference import REQUIRED_COLUMNS as CAUSAL_COLUMNS
 from causal_inference import generate_evaluation_report, run_causal_analysis
+from strategy_tuning import REQUIRED_COLUMNS as TUNING_COLUMNS
+from strategy_tuning import diagnose_strategy, generate_tuning_report
+from vintage_analysis import REQUIRED_COLUMNS as VINTAGE_COLUMNS
+from vintage_analysis import generate_vintage_report, run_vintage_analysis
+from portfolio_monitoring import REQUIRED_COLUMNS_PSI as MONITORING_COLUMNS
+from portfolio_monitoring import generate_monitoring_report, run_portfolio_monitoring
 
 
 MODE_REQUIREMENTS = {
@@ -36,6 +42,9 @@ MODE_REQUIREMENTS = {
     "risk_adjustment": RISK_ADJUSTMENT_COLUMNS,
     "dynamic_adjustment": DYNAMIC_COLUMNS,
     "causal_evaluation": CAUSAL_COLUMNS,
+    "strategy_tuning": TUNING_COLUMNS,
+    "vintage_analysis": VINTAGE_COLUMNS,
+    "portfolio_monitoring": MONITORING_COLUMNS,
     "full_limit_strategy": BASE_LIMIT_COLUMNS,
 }
 
@@ -51,6 +60,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default="analysis_output", help="Directory for generated outputs.")
     parser.add_argument("--config-path", help="Optional JSON config override path.")
+    parser.add_argument(
+        "--base-period-path",
+        help="Reference/base period data for portfolio_monitoring PSI/CSI comparison.",
+    )
     return parser.parse_args()
 
 
@@ -124,6 +137,25 @@ def determine_policy_readiness(mode: str, summary: Dict[str, Any]) -> Tuple[str,
         if evidence_tier != "causal_psm_ready":
             status = "partial"
             reasons.append(f"causal_design_is_not_fully_credible:{evidence_tier}")
+    elif mode == "strategy_tuning":
+        if summary.get("over_target_cells", 0) > 0 and summary.get("high_confidence_over_target", 0) > 0:
+            status = "partial"
+            reasons.append("high_confidence_cells_over_target_require_tightening")
+        if summary.get("insufficient_data_cells", 0) > 0:
+            if status == "ready":
+                status = "partial"
+            reasons.append("some_cells_have_insufficient_data_for_reliable_recommendations")
+    elif mode == "vintage_analysis":
+        if summary.get("deteriorating_cohorts", 0) > 0:
+            status = "partial"
+            reasons.append(f"deteriorating_cohorts_detected:{summary['deteriorating_cohorts']}")
+    elif mode == "portfolio_monitoring":
+        if summary.get("high_severity_alerts", 0) > 0:
+            status = "blocked"
+            reasons.append(f"high_severity_kpi_alerts:{summary['high_severity_alerts']}")
+        elif summary.get("total_alerts", 0) > 0 or summary.get("psi_stability") in ("moderate_shift", "significant_shift"):
+            status = "partial"
+            reasons.append("score_distribution_or_kpi_shift_detected")
     elif mode == "full_limit_strategy":
         if summary.get("skipped_steps"):
             status = "partial"
@@ -268,6 +300,44 @@ def run_full_limit_strategy(df: pd.DataFrame, output_dir: Path, config) -> Tuple
     return summary, report_lines
 
 
+def run_strategy_tuning(df: pd.DataFrame, output_dir: Path, config) -> Tuple[Dict[str, Any], List[str]]:
+    cell_df, summary = diagnose_strategy(df, config=config)
+    cell_df.to_csv(output_dir / "strategy_tuning_results.csv", index=False)
+    report_lines = generate_tuning_report(cell_df, summary)
+    return summary, report_lines
+
+
+def run_vintage_analysis_mode(df: pd.DataFrame, output_dir: Path, config) -> Tuple[Dict[str, Any], List[str]]:
+    bad_rate_matrix, z_matrix, projection_df, count_matrix, summary = run_vintage_analysis(df, config=config)
+    bad_rate_matrix.to_csv(output_dir / "vintage_bad_rate_matrix.csv")
+    z_matrix.to_csv(output_dir / "vintage_z_score_matrix.csv")
+    projection_df.to_csv(output_dir / "vintage_projection.csv", index=False)
+    count_matrix.to_csv(output_dir / "vintage_count_matrix.csv")
+    from vintage_analysis import generate_vintage_report as _gen
+    report_lines = _gen(bad_rate_matrix, z_matrix, projection_df, summary)
+    return summary, report_lines
+
+
+def run_portfolio_monitoring_mode(
+    df: pd.DataFrame,
+    base_df: pd.DataFrame,
+    output_dir: Path,
+    config,
+) -> Tuple[Dict[str, Any], List[str]]:
+    feature_cols = [c for c in df.columns if c not in ("customer_id", "score", "period", "bad_flag")]
+    psi_score, psi_detail_df, csi_df, trend_df, alerts, summary = run_portfolio_monitoring(
+        base_df, df, feature_cols=feature_cols if feature_cols else None, config=config
+    )
+    if len(psi_detail_df):
+        psi_detail_df.to_csv(output_dir / "psi_detail.csv", index=False)
+    if len(csi_df):
+        csi_df.to_csv(output_dir / "csi_results.csv", index=False)
+    if len(trend_df):
+        trend_df.to_csv(output_dir / "kpi_trends.csv", index=False)
+    report_lines = generate_monitoring_report(psi_score, psi_detail_df, csi_df, trend_df, alerts, summary, config)
+    return summary, report_lines
+
+
 def main() -> None:
     args = parse_args()
     input_path = Path(args.input_path)
@@ -287,6 +357,16 @@ def main() -> None:
         summary, report_lines = run_dynamic_adjustment(df, output_dir, config)
     elif args.mode == "causal_evaluation":
         summary, report_lines = run_causal_evaluation(df, output_dir, config)
+    elif args.mode == "strategy_tuning":
+        summary, report_lines = run_strategy_tuning(df, output_dir, config)
+    elif args.mode == "vintage_analysis":
+        summary, report_lines = run_vintage_analysis_mode(df, output_dir, config)
+    elif args.mode == "portfolio_monitoring":
+        base_path = getattr(args, "base_period_path", None)
+        if not base_path:
+            raise ValueError("portfolio_monitoring requires --base-period-path for the reference period data.")
+        base_df = read_dataframe(Path(base_path))
+        summary, report_lines = run_portfolio_monitoring_mode(df, base_df, output_dir, config)
     else:
         summary, report_lines = run_full_limit_strategy(df, output_dir, config)
 

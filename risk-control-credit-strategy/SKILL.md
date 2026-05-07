@@ -37,7 +37,9 @@ Always run the strategy in this order unless the user explicitly requests a sing
 3. **Risk adjustment**: convert capacity into approved exposure using risk score, DTI, segment coefficients, floors, and caps. See `risk-adjustment.md`.
 4. **Dynamic management**: manage existing accounts with increase, decrease, freeze, or maintain queues. See `dynamic-adjustment.md`.
 5. **Strategy tuning**: diagnose drift, isolate bad cells, propose minimal policy edits, and define rollout gates. See `strategy-tuning.md`.
-6. **Effect evaluation**: evaluate impact with A/B, quasi-experiment, matching, or explicit observational caveats. See `causal-inference.md`.
+6. **Vintage analysis**: track cohort default curves, detect deteriorating vintages, project mature bad rates. See `vintage-analysis.md`.
+7. **Portfolio monitoring**: detect score PSI/CSI drift and KPI trend alerts. See `portfolio-monitoring.md`.
+8. **Effect evaluation**: evaluate impact with A/B, quasi-experiment, matching, or explicit observational caveats. See `causal-inference.md`.
 
 ## Module Selection
 
@@ -47,7 +49,9 @@ Always run the strategy in this order unless the user explicitly requests a sing
 | How much credit a new customer can carry | `limit-calculation.md` | `base_limit` |
 | Convert base amount into risk-based final limit | `risk-adjustment.md` | `risk_adjustment` |
 | Increase/decrease/freeze existing accounts | `dynamic-adjustment.md` | `dynamic_adjustment` |
-| Diagnose and optimize an existing strategy | `strategy-tuning.md` | Use relevant single mode or `full_limit_strategy` |
+| Diagnose bad cells and adjust coefficients | `strategy-tuning.md` | `strategy_tuning` |
+| Track cohort default curves and project mature rates | `vintage-analysis.md` | `vintage_analysis` |
+| Detect score drift (PSI/CSI) and KPI alerts | `portfolio-monitoring.md` | `portfolio_monitoring` |
 | Prove whether a policy worked | `causal-inference.md` | `causal_evaluation` |
 | Full new-limit workflow from affordability to account action | All limit modules | `full_limit_strategy` |
 
@@ -88,6 +92,9 @@ Do not invent numeric claims. Use script outputs or clearly label estimates as a
 | `base_limit` | `customer_id`, `monthly_income`, `income_source`, `existing_debt`, `tenor_months` | `dti_level` |
 | `risk_adjustment` | `customer_id`, `base_limit`, `risk_score`, `dti` | `affordability_status`, `floor_eligible`, `risk_level` |
 | `dynamic_adjustment` | `customer_id`, `current_limit` | `behavior_score`, `repayment_months`, `overdue_status`, `utilization_rate`, `external_risk_flag`, `last_increase_months`, `score_change`, `multi_lending_count`, `fraud_flag`, `pd_estimate` |
+| `strategy_tuning` | `customer_id`, `bad_flag` | `risk_level` or `risk_score`, `dti_bin` or `dti`, `final_limit`, `utilization_rate`, `months_on_book`, `channel` |
+| `vintage_analysis` | `customer_id`, `origination_month`, `mob`, `dpd` | `bad_flag`, `loan_amount`, `risk_level`, `channel` |
+| `portfolio_monitoring` | `customer_id`, `score`, `period` (current file) + `--base-period-path` | `bad_flag`, `approved`, `utilization_rate`, feature columns for CSI |
 | `causal_evaluation` | `customer_id`, `treatment`, `outcome`, `limit_before`, `limit_after` | `risk_score`, `income`, `age`, `dti`, `utilization_rate` |
 | `full_limit_strategy` | base-limit columns | `risk_score`, `dti`, dynamic-management columns |
 
@@ -121,7 +128,9 @@ Treat the answer as `blocked` rather than decision-ready when:
 - risk ranking is inverted after coefficient/floor/cap application;
 - severe-risk, decrease, and increase rules conflict without priority resolution;
 - cold-start launch has no stop-loss threshold or monitoring cadence;
-- effect evaluation has no control group, no pre-period, and no covariates explaining selection.
+- effect evaluation has no control group, no pre-period, and no covariates explaining selection;
+- vintage analysis uses fewer than 3 mature reference cohorts;
+- PSI score shift is significant (>0.25) and auto-decisions have not been suspended.
 
 ## Workspace Hygiene
 
