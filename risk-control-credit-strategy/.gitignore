@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Local QA / dependency artifacts
+.qa_deps/
+
+# Generated analysis outputs
+analysis_output_*/
+
+# macOS
+.DS_Store
