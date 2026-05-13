@@ -45,7 +45,7 @@ PY
 | `loan_amount_range` | 件均范围 | [500, 5000] (USD) |
 | `loan_tenor` | 贷款期限（天） | 7–30 / 90–180 |
 | `expected_bad_rate` | 预期坏账率假设（行业对标或业务目标） | 0.08 |
-| `bad_definition` | 违约定义（见下方观察窗口指引） | FPD30 / M1_30DPD |
+| `bad_definition` | 违约定义（见下方观察窗口指引） | FPD30 / M1_DPD30+ |
 | `external_data_sources` | 可用三方数据列表 | ["bureau","blacklist","telco","device"] |
 | `risk_appetite` | 风险容忍度：最大可接受坏账率与最低通过率 | {"max_bad_rate": 0.12, "min_approval_rate": 0.30} |
 | `pricing_buffer` | 冷启动不确定性溢价（bp，叠加在基准APR上） | 300 |
@@ -324,8 +324,12 @@ def build_business_config(product_type, target_market, loan_amount_range, loan_t
         'expected_bad_rate': expected_bad_rate,
         'bad_definition': bad_definition,
         'external_data_sources': external_data_sources,
-        'risk_appetite': risk_appetite or {'max_bad_rate': expected_bad_rate * 1.5,
-                                           'min_approval_rate': 0.25},
+        'risk_appetite': risk_appetite or {
+            # Default: tolerate up to 1.5x expected bad rate, require ≥25% approval.
+            # 1.5x provides a conservative buffer for cold-start uncertainty.
+            'max_bad_rate': expected_bad_rate * 1.5,
+            'min_approval_rate': 0.25,
+        },
         'pricing_buffer_bp': pricing_buffer_bp,
         'product_cap': product_cap,
         'floor_limit': floor_limit,
@@ -342,10 +346,16 @@ def build_business_config(product_type, target_market, loan_amount_range, loan_t
 # ---------- 阶段 1：字段审计 ----------
 
 _LEAKAGE_KEYWORDS = [
+    # Post-loan delinquency terms (EN)
     'overdue', 'dpd', 'due_date', 'm0', 'm1', 'm2', 'ever_30',
-    'collection', 'write_off', 'repay', 'repayment', 'settle',
     'default', 'delinquency',
-    '逾期', '催收', '还款', '核销', '坏账', '违约',
+    # Collection and write-off terms (EN)
+    'collection', 'write_off', 'repay', 'repayment', 'settle',
+    # Post-loan delinquency terms (ZH)
+    '逾期', '坏账', '违约',
+    # Collection and write-off terms (ZH)
+    '催收', '还款', '核销',
+    # Approval result / post-loan fields (ZH)
     '放款后', '审批结果', '人工审核', '贷后', '结清',
 ]
 
@@ -456,6 +466,11 @@ def apply_rule(df, rule):
     direction = rule['direction']
     threshold = rule['threshold']
     if feature not in df.columns:
+        import warnings
+        warnings.warn(
+            'apply_rule: feature "{}" not found in DataFrame columns. '
+            'Returning False for all rows. Check data pipeline or feature_cols config.'.format(feature),
+            UserWarning, stacklevel=2)
         return pd.Series(False, index=df.index)
     s = df[feature]
     ops = {
@@ -553,8 +568,9 @@ def apply_waterfall(df, waterfall_df, reject_cutoff=3.0, review_cutoff=1.5):
         # Only update rows not yet rejected
         still_pending = (df['final_decision'] == 'approve') & mask
         df.loc[still_pending, 'final_decision'] = 'reject'
-        df.loc[still_pending & (df['reject_rule_id'] == ''), 'reject_rule_id'] = rule['rule_id']
-        df.loc[still_pending & (df['reject_layer'] == ''), 'reject_layer'] = rule['layer']
+        # still_pending already implies reject_rule_id == '' (rows just transitioned from approve)
+        df.loc[still_pending, 'reject_rule_id'] = rule['rule_id']
+        df.loc[still_pending, 'reject_layer'] = rule['layer']
 
     # Layer 4: risk scoring
     l4_rules = waterfall_df[waterfall_df['layer'] == 'L4_risk']
@@ -650,8 +666,20 @@ def simulate_rule_no_y(df, mask, assumed_base_bad_rate,
     total = len(df)
     hit_count = int(mask.sum())
     pass_count = total - hit_count
-    hit_bad_rate = min(assumed_base_bad_rate * hit_bad_rate_multiplier, 1.0)
-    pass_bad_rate = min(assumed_base_bad_rate * pass_bad_rate_multiplier, 1.0)
+    hit_bad_rate = assumed_base_bad_rate * hit_bad_rate_multiplier
+    pass_bad_rate = assumed_base_bad_rate * pass_bad_rate_multiplier
+    # Validate multiplier assumptions — uncapped values above 1.0 indicate
+    # misconfigured multipliers (e.g. hit_multiplier=10 would give 80% bad rate
+    # for an 8% base, which is unrealistic for most consumer segments).
+    if hit_bad_rate > 1.0 or pass_bad_rate > 1.0:
+        import warnings
+        warnings.warn(
+            'simulate_rule_no_y: computed bad rate exceeds 1.0 before capping '
+            '(hit={:.3f}, pass={:.3f}). Review multiplier assumptions.'.format(
+                hit_bad_rate, pass_bad_rate),
+            UserWarning, stacklevel=2)
+    hit_bad_rate = min(hit_bad_rate, 1.0)
+    pass_bad_rate = min(pass_bad_rate, 1.0)
     total_bad_assumed = total * assumed_base_bad_rate
     hit_bad = hit_count * hit_bad_rate
     pass_bad = pass_count * pass_bad_rate
@@ -757,7 +785,8 @@ def build_gray_plan(gray_ratio=0.05, split_method='random', random_state=42,
         'random_state': random_state,
         'id_col': id_col,
         'rollback_thresholds': rollback_thresholds or {
-            'fpd7_rate_hard_stop': 0.15,          # FPD7超过15%触发回滚
+            'fpd7_rate_hard_stop': 0.15,          # 3x normal (~5%) — conservatively high for cold-start
+                                                   # where the true distribution is unknown; tighten after pilot
             'hit_rate_daily_change_pct': 0.30,     # 规则命中率单日变化超30%
             'third_party_coverage_drop': 0.20,     # 三方数据覆盖率下降超20%
             'contact_rate_floor': 0.50,            # 联系率低于50%（欺诈/身份质量信号）
@@ -776,8 +805,13 @@ def assign_gray_label(df, gray_plan):
         np.random.seed(gray_plan['random_state'])
         df['is_gray'] = np.random.rand(len(df)) < gray_plan['gray_ratio']
     elif method == 'hash':
-        # Vectorized: no temporary column, uses local variable only.
-        hashes = df[id_col].astype(str).apply(lambda x: abs(hash(x)) % 100)
+        # Use hashlib.md5 for deterministic results across Python sessions.
+        # Python's built-in hash() is randomized by PYTHONHASHSEED and is
+        # not safe for reproducible gray label assignment in production.
+        import hashlib
+        def _stable_hash(x):
+            return int(hashlib.md5(str(x).encode('utf-8')).hexdigest(), 16) % 100
+        hashes = df[id_col].apply(_stable_hash)
         df['is_gray'] = hashes < gray_plan['gray_ratio'] * 100
     else:
         raise ValueError('split_method must be "random" or "hash"')
@@ -871,7 +905,9 @@ def estimate_min_sample_size(confidence=0.95, mde_pct=0.20, base_bad_rate=0.08,
     n_segments: 需要分别分析的细分数（总样本量 = n_per_segment × n_segments）。
     返回：{'n_per_segment': ..., 'total_n': ..., 'bad_count_per_segment': ...}
 
-    注意：这是统计最小量，实际建议翻倍以确保每个分层的坏件数≥30。
+    注意：这是统计最小量（正态近似二项比例检验），实际建议翻倍以确保每个分层的坏件数≥30。
+    公式：n = z² × p × (1-p) / (Δ)²，其中 Δ = mde_pct × p（绝对检测边界），
+    要求 np > 5（正态近似条件）。
     """
     from math import ceil, sqrt
     z = 1.96 if confidence == 0.95 else (2.576 if confidence == 0.99 else 1.645)
@@ -927,7 +963,6 @@ def build_strategy_summary(config, field_audit_df, rule_df, strategy_sim,
     medium = int((rule_df['confidence'] == 'MEDIUM').sum()) if rule_df is not None else None
     low = int((rule_df['confidence'] == 'LOW').sum()) if rule_df is not None else None
     rule_total = (high + medium + low) if high is not None else None
-    fmt = lambda v: 'N/A' if v is None else v
     hit_rate = strategy_sim.get('hit_rate', 'N/A') if strategy_sim else 'N/A'
     pass_rate = strategy_sim.get('pass_rate', 'N/A') if strategy_sim else 'N/A'
     post_br = strategy_sim.get('post_strategy_bad_rate', 'N/A') if strategy_sim else 'N/A'
@@ -949,7 +984,10 @@ def build_strategy_summary(config, field_audit_df, rule_df, strategy_sim,
         '',
         '## 3. 规则清单',
         '- 规则总数: {}  HIGH: {}  MEDIUM: {}  LOW: {}'.format(
-            fmt(rule_total), fmt(high), fmt(medium), fmt(low)),
+            rule_total if rule_total is not None else 'N/A',
+            high if high is not None else 'N/A',
+            medium if medium is not None else 'N/A',
+            low if low is not None else 'N/A'),
         '',
         '## 4. 前置估计（中性假设）',
         '- 命中率: {}  通过率: {}  通过后坏账率: {}'.format(hit_rate, pass_rate, post_br),
