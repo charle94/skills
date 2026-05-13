@@ -1,6 +1,6 @@
 ---
 name: cold-start-credit-risk
-description: 基于 pandas 和 numpy 的信贷风控冷启动方案。适用于无历史表现样本的新产品/新市场/新渠道场景，通过专家规则、三方数据评估、灰度上线与迭代学习快速构建初始风控策略。
+description: 基于 pandas、numpy 和 scikit-learn 的信贷风控冷启动方案。适用于无历史表现样本的新产品/新市场/新渠道场景，通过专家规则、三方数据评估、简单逻辑回归分层评分、灰度上线与迭代学习快速构建初始风控策略。
 allowed-tools: Bash(python3:*) Bash(python:*) Bash(pip:*) Bash(pip3:*)
 ---
 
@@ -17,7 +17,7 @@ allowed-tools: Bash(python3:*) Bash(python:*) Bash(pip:*) Bash(pip3:*)
 - 无Y标签时的规则效果前置估计
 - 初始规则评分卡（Rule-based Scorecard）搭建
 
-**工具限制：** 仅允许 `pandas`、`numpy`、`json`、`datetime`。禁止使用 scikit-learn、xgboost、lightgbm、toad、scorecardpy 等建模库。冷启动阶段无需复杂模型，所有计算必须基于 pandas DataFrame 操作，确保可审计、可复现。
+**工具限制：** 允许 `pandas`、`numpy`、`json`、`datetime`，以及 `scikit-learn`（仅限简单逻辑回归 `LogisticRegression` 和基础评估指标，用于灰度期积累足够样本后的初始分层评分）。禁止使用 xgboost、lightgbm、toad、scorecardpy 等复杂集成/专有建模库。冷启动阶段的核心目标是**规则先行、简单模型辅助分层**，所有决策必须可审计、可复现、有业务解释。
 
 ## 环境校验
 
@@ -25,7 +25,7 @@ allowed-tools: Bash(python3:*) Bash(python:*) Bash(pip:*) Bash(pip3:*)
 python3 - <<'PY'
 import sys
 print('python', sys.version)
-for name in ['pandas', 'numpy']:
+for name in ['pandas', 'numpy', 'sklearn']:
     try:
         m = __import__(name)
         print(name, getattr(m, '__version__', 'ok'))
@@ -1060,7 +1060,7 @@ def build_strategy_summary(config, field_audit_df, rule_df, strategy_sim,
 
 ## 禁止事项
 
-1. **禁止使用 ML 建模库**：冷启动阶段禁止 scikit-learn、xgboost、lightgbm、toad、scorecardpy。
+1. **禁止使用复杂集成/专有建模库**：冷启动阶段禁止 xgboost、lightgbm、toad、scorecardpy。`scikit-learn` 仅允许用于简单逻辑回归（`LogisticRegression`）和基础评估指标（`roc_auc_score`、`KFold` 等），不得构建复杂集成模型或高维特征工程流水线。
 2. **禁止跳过灰度直接全量上线**：灰度比例不低于 1%，建议 5%。对照组必须保留基本合规与反欺诈规则。
 3. **禁止无依据设定阈值**：所有规则阈值必须有业务解释或外部对标，记录在 `business_rationale`。
 4. **禁止覆盖率 <70% 的字段作为唯一硬拒依据**：可降级为人工审核参考或观察字段。
