@@ -326,8 +326,12 @@ def build_business_config(product_type, target_market, loan_amount_range, loan_t
         'external_data_sources': external_data_sources,
         'risk_appetite': risk_appetite or {
             # Default: tolerate up to 1.5x expected bad rate, require ≥25% approval.
-            # 1.5x provides a conservative buffer for cold-start uncertainty.
+            # 1.5x is derived from typical cold-start variance: with <500 mature samples
+            # the 95% CI on a bad rate can easily span ±30-50% relative, so 1.5x
+            # gives a safety margin before the policy triggers a mandatory review.
+            # Tighten this multiplier once 1000+ samples have matured.
             'max_bad_rate': expected_bad_rate * 1.5,
+            # 25% minimum approval avoids a useless pilot with too few observations.
             'min_approval_rate': 0.25,
         },
         'pricing_buffer_bp': pricing_buffer_bp,
@@ -456,16 +460,24 @@ def build_hard_reject_rules(fraud_blacklist_cols=None, compliance_rules=None):
 
 # ---------- 阶段 4：策略漏斗与专家规则 ----------
 
-def apply_rule(df, rule):
+def apply_rule(df, rule, strict=False):
     """
     对 DataFrame 应用单条规则，返回布尔掩码（True=命中/触发）。
     NaN 视为未命中（False）：缺失数据不触发拒绝规则。
     若需对缺失值单独处理，请在调用前补填或单独定义"缺失值规则"。
+
+    strict: 若为 True，feature 不存在时抛出 KeyError（推荐用于 Layer 1-2 硬拒规则，
+            确保黑名单字段缺失时不会静默放行）。默认 False，仅发出 UserWarning。
     """
     feature = rule['feature']
     direction = rule['direction']
     threshold = rule['threshold']
     if feature not in df.columns:
+        if strict:
+            raise KeyError(
+                'apply_rule(strict=True): feature "{}" not found in DataFrame. '
+                'Missing fraud/blacklist signals must not silently pass. '
+                'Ensure the data pipeline provides this column.'.format(feature))
         import warnings
         warnings.warn(
             'apply_rule: feature "{}" not found in DataFrame columns. '
@@ -668,16 +680,17 @@ def simulate_rule_no_y(df, mask, assumed_base_bad_rate,
     pass_count = total - hit_count
     hit_bad_rate = assumed_base_bad_rate * hit_bad_rate_multiplier
     pass_bad_rate = assumed_base_bad_rate * pass_bad_rate_multiplier
-    # Validate multiplier assumptions — uncapped values above 1.0 indicate
-    # misconfigured multipliers (e.g. hit_multiplier=10 would give 80% bad rate
-    # for an 8% base, which is unrealistic for most consumer segments).
+    # Validate multiplier assumptions — values above 1.0 indicate misconfigured
+    # multipliers (e.g. hit_multiplier=10 gives 80% bad rate for an 8% base,
+    # which is unrealistic). Raise ValueError to prevent silent mask with capping.
     if hit_bad_rate > 1.0 or pass_bad_rate > 1.0:
-        import warnings
-        warnings.warn(
+        raise ValueError(
             'simulate_rule_no_y: computed bad rate exceeds 1.0 before capping '
-            '(hit={:.3f}, pass={:.3f}). Review multiplier assumptions.'.format(
-                hit_bad_rate, pass_bad_rate),
-            UserWarning, stacklevel=2)
+            '(hit={:.3f}, pass={:.3f}). Review multiplier assumptions: '
+            'hit_multiplier={}, pass_multiplier={}, base_bad_rate={}.'.format(
+                hit_bad_rate, pass_bad_rate,
+                hit_bad_rate_multiplier, pass_bad_rate_multiplier,
+                assumed_base_bad_rate))
     hit_bad_rate = min(hit_bad_rate, 1.0)
     pass_bad_rate = min(pass_bad_rate, 1.0)
     total_bad_assumed = total * assumed_base_bad_rate
@@ -914,7 +927,12 @@ def estimate_min_sample_size(confidence=0.95, mde_pct=0.20, base_bad_rate=0.08,
     p = base_bad_rate
     mde = mde_pct * p  # absolute MDE
     n_per_segment = ceil(z ** 2 * p * (1 - p) / (mde ** 2))
-    # Ensure at least 30 bad cases per segment for stable rate estimation
+    # Ensure at least 30 bad cases per segment: the Central Limit Theorem (CLT)
+    # approximation for binomial proportions requires np > 5 (and np(1-p) > 5),
+    # but empirically 30 bad cases is a common minimum for stable bad rate estimates
+    # in credit risk (avoids extreme variance in observed bad rate e.g. 0/100 = 0%).
+    # This threshold can be relaxed to 15 for exploratory analysis or tightened
+    # to 50+ for segment-level policy decisions requiring high confidence.
     n_for_30_bads = ceil(30 / p)
     n_per_segment = max(n_per_segment, n_for_30_bads)
     return {
