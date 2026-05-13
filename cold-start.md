@@ -108,7 +108,9 @@ def save_json(obj, path):
 
 
 def safe_rate(num, den):
-    return float(num) / (float(den) + EPSILON) if den else 0.0
+    """Return num/den; returns 0.0 when den is zero or effectively zero."""
+    d = float(den)
+    return float(num) / d if d > EPSILON else 0.0
 
 
 def now_text():
@@ -272,6 +274,9 @@ def apply_rule(df, rule):
     }
     if direction not in ops:
         raise ValueError('Unknown direction: {}'.format(direction))
+    # NaN is treated as non-hit (False): missing data never triggers a reject rule.
+    # Callers that require explicit handling of missing values should impute before
+    # calling this function or track coverage separately via coverage_report().
     return ops[direction].fillna(False)
 
 
@@ -431,9 +436,10 @@ def assign_gray_label(df, gray_plan):
         np.random.seed(gray_plan['random_state'])
         df['is_gray'] = np.random.rand(len(df)) < gray_plan['gray_ratio']
     elif method == 'hash':
-        df['_hash'] = df[id_col].apply(lambda x: abs(hash(str(x))) % 100)
-        df['is_gray'] = df['_hash'] < gray_plan['gray_ratio'] * 100
-        df.drop(columns=['_hash'], inplace=True)
+        # Vectorized: convert ids to strings, hash via pandas Series apply,
+        # then use modulo — avoids a Python-level loop for large DataFrames.
+        hashes = df[id_col].astype(str).apply(lambda x: abs(hash(x)) % 100)
+        df['is_gray'] = hashes < gray_plan['gray_ratio'] * 100
     else:
         raise ValueError('split_method must be "random" or "hash"')
     return df
@@ -517,10 +523,11 @@ def build_strategy_summary(config, field_audit_df, rule_df, strategy_sim, gray_p
     """生成策略总结 Markdown 报告（所有占位符均来自实际计算结果）。"""
     keep = int((field_audit_df['decision'] == 'keep').sum()) if field_audit_df is not None else 'N/A'
     drop = int((field_audit_df['decision'] == 'drop').sum()) if field_audit_df is not None else 'N/A'
-    high = int((rule_df['confidence'] == 'HIGH').sum()) if rule_df is not None else 'N/A'
-    medium = int((rule_df['confidence'] == 'MEDIUM').sum()) if rule_df is not None else 'N/A'
-    low = int((rule_df['confidence'] == 'LOW').sum()) if rule_df is not None else 'N/A'
-    rule_total = (high + medium + low) if all(isinstance(x, int) for x in [high, medium, low]) else 'N/A'
+    high = int((rule_df['confidence'] == 'HIGH').sum()) if rule_df is not None else None
+    medium = int((rule_df['confidence'] == 'MEDIUM').sum()) if rule_df is not None else None
+    low = int((rule_df['confidence'] == 'LOW').sum()) if rule_df is not None else None
+    rule_total = (high + medium + low) if high is not None else None
+    fmt = lambda v: 'N/A' if v is None else v
     hit_rate = strategy_sim.get('hit_rate', 'N/A') if strategy_sim else 'N/A'
     pass_rate = strategy_sim.get('pass_rate', 'N/A') if strategy_sim else 'N/A'
     post_br = strategy_sim.get('post_strategy_bad_rate', 'N/A') if strategy_sim else 'N/A'
@@ -537,7 +544,8 @@ def build_strategy_summary(config, field_audit_df, rule_df, strategy_sim, gray_p
         '- 可用字段: {}  剔除字段: {}'.format(keep, drop),
         '',
         '## 3. 规则清单',
-        '- 规则总数: {}  HIGH: {}  MEDIUM: {}  LOW: {}'.format(rule_total, high, medium, low),
+        '- 规则总数: {}  HIGH: {}  MEDIUM: {}  LOW: {}'.format(
+            fmt(rule_total), fmt(high), fmt(medium), fmt(low)),
         '',
         '## 4. 前置估计（中性假设）',
         '- 命中率: {}  通过率: {}  通过后坏账率: {}'.format(hit_rate, pass_rate, post_br),
