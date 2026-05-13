@@ -1,0 +1,999 @@
+---
+name: sklearn-pandas-credit-risk
+description: Use pandas, numpy, scikit-learn, and graphviz as a toad-free replacement for credit risk third-party data evaluation, WOE/IV/PSI, decision-tree rule mining, and rule simulation.
+allowed-tools: Bash(python3:*) Bash(python:*) Bash(pip:*) Bash(pip3:*)
+---
+
+# Pandas + Sklearn 信贷三方数据评估与规则挖掘平替方案
+
+## 目标
+
+使用本 skill 时，agent 必须按信贷风控流程完成三方数据评估、规则挖掘、规则制定、规则模拟和可追溯交付。最终结果不能只给结论，必须给出支撑结论的样本口径、变量证据、规则证据、跨期稳定性、业务解释、置信等级和决策日志。本 skill 是 `toad-credit-risk` 的 pandas + scikit-learn 平替版本：除代码实现不依赖 toad 外，约束条件、中间输出和交付要求必须与 toad 版本保持一致。
+
+## 适用任务
+
+适用于以下任务：三方数据准入评估、变量有效性分析、特征筛选、自动/人工分箱、WOE/IV/KS/AUC/PSI 分析、评分卡辅助分析、单变量规则挖掘、组合规则挖掘、拒绝/审核/降额策略模拟、规则上线前评审材料生成。
+
+## sklearn/pandas 环境约束
+
+只依赖 `pandas`、`numpy`、`scikit-learn`，可选 `graphviz` 生成决策树图片；不得依赖 toad。
+
+```bash
+python3 - <<'PY'
+import sys
+print('python', sys.version)
+for name in ['pandas', 'numpy', 'sklearn', 'graphviz']:
+    try:
+        module = __import__(name)
+        print(name, getattr(module, '__version__', 'unknown'))
+    except Exception as exc:
+        print(name, 'IMPORT_FAILED', exc)
+PY
+```
+
+如 `graphviz` Python 包或系统 `dot` 命令不可用，仍必须输出 `.dot` 文件，并在报告中说明 PNG 渲染失败原因。
+
+## 输入口径
+
+执行前必须在代码或报告中固化这些口径：
+
+- `target`：二分类坏样本标签，通常 `1=bad/default/overdue`，`0=good`。
+- `id_col`：客户、申请或订单唯一标识，只用于去重与排查，不进入建模。
+- `time_col`：申请月、放款月或观察窗口，用于 train/test/OOT、PSI 和按月模拟。
+- `exclude_cols`：目标、ID、时间、贷后字段、结果字段、人工审批结论、明显泄露字段。
+- `feature_cols`：三方征信、设备、运营商、多头、黑名单、行为画像、司法风险等候选字段。
+- `sample_split`：必须通过 `split_samples` 固化为 `sample_type` 列，取值 `train`、`test`、`oot`；没有时间列时用固定随机种子的分层随机切分替代并说明限制。
+
+## 总体执行框架
+
+按以下阶段执行，每阶段都要产出 CSV/JSON/Markdown 文件，并把阶段判断写入 `decision_log.csv`。
+
+| 阶段 | 目标 | 主要 sklearn/pandas/API | 核心产出 | 进入下一阶段条件 |
+|---|---|---|---|---|
+| 0. 口径与环境 | 固化样本、字段、版本、train/test/OOT 划分 | 环境检查、`split_samples` | `run_config.json`, `environment.json`, `sample_profile.csv`, `sample_split_log.csv` | 目标字段二分类，版本可运行，`sample_type` 已固化 |
+| 0.5 字段可得性与泄露审计 | 排除贷后、结果、人工审批、不可稳定获取字段 | pandas 字段字典审计 | `field_audit.csv`, `leakage_audit.csv` | 字段可得时间早于审批决策，泄露风险可控 |
+| 1. 数据质量 | 判断字段可用性 | pandas describe/value_counts | `data_quality.csv`, `outlier_summary.csv` | 覆盖率、唯一值、异常值可解释 |
+| 2. 分箱与 WOE/IV | 建立可解释风险区间并计算 IV | pandas qcut/cut/groupby, WOE/IV | `bin_detail.csv`, `bin_rules.json`, `woe_rules.json`, `monotonicity_check.csv`, `bin_merge_log.csv` | 分箱样本充足、可复用，WOE/IV 有证据 |
+| 3. PSI 与稳定性 | 评估 train/test/OOT 分箱分布漂移 | 分箱分布 PSI | `psi_table.csv`, `bin_psi_detail.csv` | train/test/OOT 漂移可解释 |
+| 4. KS/AUC 变量有效性 | 评估变量区分能力 | sklearn metrics | `feature_quality.csv`, `feature_correlation.csv` | IV/KS/AUC 有证据，排除泄露和冗余 |
+| 5. 规则挖掘 | 使用决策树生成候选单规则 | `DecisionTreeClassifier`, `graphviz` | `decision_tree_rules.csv`, `single_rule_candidates.csv`, `decision_tree.png`, `rule_overlap_matrix.csv` | 节点正负样本、触碰率、坏比例、lift、规则路径清晰 |
+| 6. 策略制定与模拟 | 选择动作、阈值并评估业务影响 | 业务约束 + pandas mask | `strategy_rules.csv`, `strategy_comparison.csv`, `rule_simulation.csv`, `strategy_level_simulation.csv`, `monthly_rule_simulation.csv`, `segment_rule_simulation.csv` | train/test/OOT 表现一致或差异有解释 |
+| 7. 总结评审 | 可追溯结论 | 证据汇总 | `strategy_summary.md`, `confidence_evidence.csv` | 每条结论可追溯到数据和规则证据 |
+| 8. 上线监控 | 固化灰度与监控阈值 | 指标阈值表 | `monitoring_plan.csv` | 命中率、坏账率、PSI、覆盖率、拒绝率监控口径明确 |
+
+## 置信与可追溯要求
+
+每个变量、规则和策略都必须有唯一 ID：`feature_id`、`bin_id`、`rule_id`、`strategy_id`。所有报告通过这些 ID 串联，禁止只在文字里描述。
+
+置信等级按以下口径给出：
+
+- `HIGH`：样本占比足够、坏样本数足够、train/test/OOT 坏账率方向一致、PSI 可接受、业务解释清晰、无泄露。
+- `MEDIUM`：效果明显但存在样本偏小、跨期轻微波动或业务解释需复核，只能建议审核/观察或小流量验证。
+- `LOW`：样本不足、跨期不稳定、解释弱、疑似泄露或只在单期有效，不建议上线强规则。
+
+每条结论必须落到 `confidence_evidence.csv`：
+
+```text
+evidence_id,object_type,object_id,metric_name,train_value,test_value,oot_value,threshold,pass_flag,confidence,reason,source_file
+```
+
+每个关键动作必须落到 `decision_log.csv`：
+
+```text
+timestamp,stage,object_id,decision,reason,input_files,output_files,operator_note
+```
+
+## 核心代码模板
+
+以下代码是 agent 写正式脚本时的骨架。可按任务裁剪，但不能删除字段口径、证据、模拟和日志能力；代码实现必须使用 pandas + sklearn 平替，不得引入 toad。
+
+```python
+# -*- coding: utf-8 -*-
+from __future__ import print_function
+
+import json
+import os
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier, _tree
+
+
+EPSILON = 1e-10
+
+
+def ensure_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+
+def save_json(obj, path):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def safe_rate(num, den):
+    return float(num) / float(den) if den else 0.0
+
+
+def now_text():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+```
+
+## 阶段 0：样本口径
+
+所有后续分析必须优先通过 `sample_type` 引用样本集：分箱规则、WOE/IV、变量质量和规则树以 `train` 为基准，PSI 对比 `train/test/oot`，策略模拟分别输出各样本集表现。若输入缺少 `sample_type`，只能用 `get_sample` 明确降级为全量 train，并在 `decision_log.csv` 记录风险。
+
+```python
+def validate_binary_target(df, target):
+    values = sorted(pd.Series(df[target]).dropna().unique().tolist())
+    if values != [0, 1]:
+        raise ValueError('target must be binary 0/1, got: %s' % values)
+
+
+def sample_profile(df, target, time_col=None, sample_type_col='sample_type'):
+    rows = [{'segment': 'ALL', 'sample_count': len(df), 'bad_count': int(df[target].sum()), 'bad_rate': float(df[target].mean())}]
+    if sample_type_col in df.columns:
+        for sample_type, group in df.groupby(sample_type_col):
+            rows.append({'segment': str(sample_type), 'sample_count': len(group), 'bad_count': int(group[target].sum()), 'bad_rate': float(group[target].mean())})
+    if time_col:
+        for period, group in df.groupby(time_col):
+            rows.append({'segment': str(period), 'sample_count': len(group), 'bad_count': int(group[target].sum()), 'bad_rate': float(group[target].mean())})
+    return pd.DataFrame(rows)
+
+
+def split_samples(df, target, time_col=None, oot_months=3, test_ratio=0.2, oot_ratio=0.1, random_state=42, sample_type_col='sample_type'):
+    result = df.copy()
+    log_rows = []
+    if time_col and time_col in result.columns:
+        periods = sorted(pd.Series(result[time_col]).dropna().unique().tolist())
+        if len(periods) > oot_months:
+            oot_periods = set(periods[-oot_months:])
+            base_idx = result.index[~result[time_col].isin(oot_periods)]
+            oot_idx = result.index[result[time_col].isin(oot_periods)]
+            ordered_base = result.loc[base_idx].sort_values(time_col)
+            test_size = int(round(len(ordered_base) * test_ratio))
+            test_idx = ordered_base.index[-test_size:] if test_size else []
+            train_idx = ordered_base.index.difference(test_idx)
+            method = 'time_oot_time_test'
+        else:
+            train_idx, test_idx, oot_idx = stratified_random_split(result, target, test_ratio, oot_ratio, random_state)
+            method = 'fallback_stratified_random_insufficient_periods'
+    else:
+        train_idx, test_idx, oot_idx = stratified_random_split(result, target, test_ratio, oot_ratio, random_state)
+        method = 'stratified_random_no_time_col'
+    result[sample_type_col] = 'train'
+    result.loc[test_idx, sample_type_col] = 'test'
+    result.loc[oot_idx, sample_type_col] = 'oot'
+    for sample_type, group in result.groupby(sample_type_col):
+        log_rows.append({'sample_type': sample_type, 'sample_count': len(group), 'sample_rate': safe_rate(len(group), len(result)), 'bad_count': int(group[target].sum()), 'bad_rate': float(group[target].mean()), 'split_method': method, 'random_state': random_state})
+    return result, pd.DataFrame(log_rows)
+
+
+def stratified_random_split(df, target, test_ratio=0.2, oot_ratio=0.1, random_state=42):
+    rest_idx, test_idx = train_test_split(df.index, test_size=test_ratio, stratify=df[target], random_state=random_state)
+    rest = df.loc[rest_idx]
+    relative_oot_ratio = safe_rate(oot_ratio, 1.0 - test_ratio)
+    train_idx, oot_idx = train_test_split(rest.index, test_size=relative_oot_ratio, stratify=rest[target], random_state=random_state)
+    return train_idx, test_idx, oot_idx
+
+
+def get_sample(df, sample_type_col='sample_type', label='train'):
+    if sample_type_col not in df.columns:
+        print('WARNING: %s missing; using all rows as train, risk accepted by operator' % sample_type_col)
+        return df.copy()
+    return df[df[sample_type_col] == label].copy()
+
+
+def infer_feature_cols(df, target, id_col=None, time_col=None, exclude_cols=None):
+    excluded = set(exclude_cols or [])
+    excluded.add(target)
+    if id_col:
+        excluded.add(id_col)
+    if time_col:
+        excluded.add(time_col)
+    return [c for c in df.columns if c not in excluded]
+```
+
+阶段 0.5 必须做字段可得性与泄露审计。字段字典至少包含字段名、数据源、字段含义、可得时间、是否贷前可得、是否人工结果、是否贷后表现、是否稳定供应、处理结论。若字段可得时间晚于审批/观察时间点，必须强制剔除。
+
+```python
+def check_time_leakage(available_time, decision_time):
+    if available_time in (None, '') or decision_time in (None, ''):
+        return False
+    try:
+        return pd.to_datetime(available_time) > pd.to_datetime(decision_time)
+    except Exception:
+        return False
+
+
+def audit_fields(feature_cols, field_meta=None, decision_time=None):
+    field_meta = field_meta or {}
+    risky_keywords = [
+        'overdue', 'dpd', 'due_date', 'm0', 'm1', 'm2', 'ever_30', 'ever30', 'collection', 'write_off',
+        'repay', 'repayment', 'settle', 'default', 'delinquency', '逾期', '逾期天数', '逾期金额', '催收',
+        '还款', '核销', '坏账', '违约', '放款后', '审批结果', '人工审核', '拒绝原因', '贷后', '结清'
+    ]
+    rows = []
+    for col in feature_cols:
+        meta = field_meta.get(col, {})
+        text = (col + ' ' + str(meta.get('meaning', '')) + ' ' + str(meta.get('available_time', ''))).lower()
+        keyword_hit = [kw for kw in risky_keywords if kw.lower() in text]
+        pre_decision_available = bool(meta.get('pre_decision_available', True))
+        field_decision_time = meta.get('decision_time', decision_time)
+        time_leakage_flag = check_time_leakage(meta.get('available_time', ''), field_decision_time)
+        leakage_flag = bool(keyword_hit) or (not pre_decision_available) or bool(meta.get('post_loan_field', False)) or time_leakage_flag
+        rows.append({
+            'feature': col,
+            'source': meta.get('source', ''),
+            'meaning': meta.get('meaning', ''),
+            'available_time': meta.get('available_time', ''),
+            'pre_decision_available': pre_decision_available,
+            'post_loan_field': bool(meta.get('post_loan_field', False)),
+            'keyword_hit': ','.join(keyword_hit),
+            'time_leakage_flag': time_leakage_flag,
+            'leakage_flag': leakage_flag,
+            'decision': 'drop' if leakage_flag else 'keep',
+        })
+    return pd.DataFrame(rows)
+```
+
+## 阶段 1：数据质量
+
+```python
+def data_quality(df, feature_cols, special_values=None):
+    special_values = special_values or {}
+    total = len(df)
+    rows = []
+    for col in feature_cols:
+        s = df[col]
+        vc = s.value_counts(dropna=True)
+        rows.append({
+            'feature': col,
+            'dtype': str(s.dtype),
+            'sample_count': total,
+            'missing_count': int(s.isna().sum()),
+            'missing_rate': float(s.isna().mean()),
+            'coverage_rate': float(s.notna().mean()),
+            'unique_count': int(s.nunique(dropna=True)),
+            'unique_rate': safe_rate(int(s.nunique(dropna=True)), total),
+            'top1_value': str(vc.index[0]) if len(vc) else '',
+            'top1_rate': safe_rate(int(vc.iloc[0]), total) if len(vc) else 0.0,
+            'special_rate': float(s.isin(special_values.get(col, [])).mean()) if col in special_values else 0.0,
+            'is_constant': int(s.nunique(dropna=True)) <= 1,
+            'is_high_cardinality': int(s.nunique(dropna=True)) > max(50, int(total * 0.2)),
+        })
+    return pd.DataFrame(rows)
+
+
+def outlier_summary(df, feature_cols):
+    rows = []
+    for col in feature_cols:
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        s = df[col].dropna()
+        if s.empty:
+            continue
+        q1, q3 = s.quantile(0.25), s.quantile(0.75)
+        iqr = q3 - q1
+        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        rows.append({'feature': col, 'lower_bound': lower, 'upper_bound': upper, 'outlier_rate': float(((df[col] < lower) | (df[col] > upper)).mean())})
+    return pd.DataFrame(rows)
+```
+
+## 阶段 2：分箱、WOE、IV
+
+数值变量优先使用 `qcut` 等频分箱；类别变量保留 Top N 类别，其余归为 `OTHER`；缺失统一为 `MISSING`。必须输出每个箱的好坏样本、坏比例、WOE、IV 分量和 lift。分箱规则保存为 `bin_rules.json`，结构要包含 `variable_type`、类型、切点/标签/类别映射，确保 OOT 和未来样本复用同一分箱；逐箱明细保存为 `bin_detail.csv`，WOE 映射保存为 `woe_rules.json`，变量汇总进入 `feature_quality.csv`。数值分箱输出必须是有序 `pd.Categorical`，顺序为 `MISSING`、按区间边界升序排列的区间、`SPECIAL`，单调性检查和合并必须复用该顺序，不得按字符串排序。调用顺序必须是：`build_bin_rules` -> `apply_bin_rules(df[list(bin_rules.keys())], bin_rules)` -> `enforce_monotonic_bins(df, binned, target, bin_rules)` -> `build_woe_iv(df_train, 'target_col_name', binned, feature_cols)`；如单调性不满足，优先业务解释，无法解释时合并相邻数值分箱并输出 `bin_merge_log.csv`。
+
+```python
+def bin_numeric_series(s, bins=10, special_values=None):
+    special_values = special_values or []
+    result = pd.Series(index=s.index, dtype='object')
+    special_mask = s.isin(special_values) if special_values else pd.Series(False, index=s.index)
+    missing_mask = s.isna() & (~special_mask)
+    result.loc[special_mask] = 'SPECIAL'
+    result.loc[missing_mask] = 'MISSING'
+    regular = s.loc[~special_mask & ~missing_mask]
+    if regular.nunique(dropna=True) <= 1:
+        result.loc[regular.index] = 'ALL'
+        return result.fillna('MISSING')
+    try:
+        result.loc[regular.index] = pd.qcut(regular, q=bins, duplicates='drop').astype(str)
+    except Exception:
+        result.loc[regular.index] = pd.cut(regular, bins=min(bins, regular.nunique()), duplicates='drop').astype(str)
+    return result.fillna('MISSING')
+
+
+def bin_categorical_series(s, max_levels=20):
+    result = s.astype('object').where(s.notna(), 'MISSING').astype(str)
+    top_values = set(result.value_counts().head(max_levels).index.tolist())
+    return result.where(result.isin(top_values), 'OTHER')
+
+
+def build_binned_frame(df, feature_cols, bins=10, max_levels=20, special_values=None):
+    bin_rules = build_bin_rules(df, feature_cols, bins=bins, max_levels=max_levels, special_values=special_values)
+    binned = apply_bin_rules(df[feature_cols], bin_rules)
+    return binned, bin_rules
+
+
+def build_bin_rules(df, feature_cols, bins=10, max_levels=20, special_values=None):
+    special_values = special_values or {}
+    rules = {}
+    for col in feature_cols:
+        s = df[col]
+        if pd.api.types.is_numeric_dtype(s):
+            regular = s.loc[~s.isna() & ~s.isin(special_values.get(col, []))]
+            if regular.nunique(dropna=True) <= 1:
+                cut_points = []
+            else:
+                try:
+                    cut_points = sorted(pd.qcut(regular, q=bins, duplicates='drop').cat.categories.right.astype(float).tolist())
+                    cut_points = cut_points[:-1]
+                except Exception:
+                    cut_points = sorted(pd.cut(regular, bins=min(bins, regular.nunique()), duplicates='drop').cat.categories.right.astype(float).tolist())[:-1]
+            rules[col] = {'type': 'numeric', 'variable_type': 'numeric_continuous', 'cut_points': cut_points, 'special_values': special_values.get(col, [])}
+        else:
+            top_values = s.astype('object').where(s.notna(), 'MISSING').astype(str).value_counts().head(max_levels).index.tolist()
+            rules[col] = {'type': 'categorical', 'variable_type': 'categorical', 'levels': top_values}
+    return rules
+
+
+def ordered_numeric_categories(cuts, has_special=False):
+    interval_labels = pd.IntervalIndex.from_breaks(cuts).astype(str).tolist()
+    categories = ['MISSING'] + interval_labels
+    if has_special:
+        categories.append('SPECIAL')
+    return categories
+
+
+def ordered_labels_from_binned(binned_s):
+    present = set(binned_s.astype(str).dropna().tolist())
+    if isinstance(binned_s.dtype, pd.CategoricalDtype) and binned_s.cat.ordered:
+        return [str(label) for label in binned_s.cat.categories if str(label) in present]
+    return sorted(present)
+
+
+def apply_bin_rules(df, bin_rules):
+    missing_cols = set(bin_rules.keys()) - set(df.columns)
+    if missing_cols:
+        raise KeyError('bin_rules contains columns not in df: %s' % sorted(missing_cols))
+    binned = pd.DataFrame(index=df.index)
+    for col, rule in bin_rules.items():
+        s = df[col]
+        if rule['type'] == 'numeric':
+            result = pd.Series(index=s.index, dtype='object')
+            special = rule.get('special_values', [])
+            special_mask = s.isin(special) if special else pd.Series(False, index=s.index)
+            missing_mask = s.isna() & (~special_mask)
+            result.loc[special_mask] = 'SPECIAL'
+            result.loc[missing_mask] = 'MISSING'
+            cuts = [-np.inf] + list(rule.get('cut_points', [])) + [np.inf]
+            regular = s.loc[~special_mask & ~missing_mask]
+            result.loc[regular.index] = pd.cut(regular, bins=cuts, duplicates='drop').astype(str)
+            categories = ordered_numeric_categories(cuts, has_special=bool(special))
+            binned[col] = pd.Categorical(result.fillna('MISSING'), categories=categories, ordered=True)
+        else:
+            levels = set(rule.get('levels', []))
+            values = s.astype('object').where(s.notna(), 'MISSING').astype(str)
+            binned[col] = values.where(values.isin(levels), 'OTHER')
+    return binned
+
+
+def woe_iv_for_binned_feature(binned_s, target_s, feature):
+    total = len(target_s)
+    total_bad = int(target_s.sum())
+    total_good = total - total_bad
+    overall_bad_rate = safe_rate(total_bad, total)
+    rows = []
+    variable_type = 'numeric_continuous' if isinstance(binned_s.dtype, pd.CategoricalDtype) and binned_s.cat.ordered else 'categorical'
+    temp = pd.DataFrame({'bin_label': binned_s.astype(str), 'target': target_s.astype(int)})
+    for bin_order, bin_label in enumerate(ordered_labels_from_binned(binned_s)):
+        group = temp[temp['bin_label'] == str(bin_label)]
+        bad = int(group['target'].sum())
+        sample_count = len(group)
+        good = sample_count - bad
+        bad_dist = safe_rate(bad, total_bad)
+        good_dist = safe_rate(good, total_good)
+        woe = np.log((good_dist + EPSILON) / (bad_dist + EPSILON))
+        iv_component = (good_dist - bad_dist) * woe
+        bad_rate = safe_rate(bad, sample_count)
+        rows.append({
+            'feature': feature,
+            'variable_type': variable_type,
+            'bin_order': bin_order,
+            'bin_label': str(bin_label),
+            'sample_count': sample_count,
+            'sample_rate': safe_rate(sample_count, total),
+            'good_count': good,
+            'bad_count': bad,
+            'bad_rate': bad_rate,
+            'overall_bad_rate': overall_bad_rate,
+            'lift': safe_rate(bad_rate, overall_bad_rate),
+            'woe': woe,
+            'iv_component': iv_component,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_woe_iv(df, target, binned, feature_cols):
+    if not isinstance(target, str) or target not in df.columns:
+        raise TypeError('target must be a column name string present in df')
+    detail_frames = []
+    summary_rows = []
+    for col in feature_cols:
+        detail = woe_iv_for_binned_feature(binned[col], df[target], col)
+        iv = float(detail['iv_component'].sum()) if len(detail) else 0.0
+        detail_frames.append(detail)
+        summary_rows.append({'feature': col, 'iv': iv, 'bin_count': int(detail['bin_label'].nunique())})
+    return pd.concat(detail_frames, ignore_index=True), pd.DataFrame(summary_rows).sort_values('iv', ascending=False)
+
+
+def apply_woe_transform(binned, bin_detail):
+    woe_df = pd.DataFrame(index=binned.index)
+    for feature, group in bin_detail.groupby('feature'):
+        mapping = dict(zip(group['bin_label'].astype(str), group['woe']))
+        woe_df[feature] = binned[feature].astype(str).map(mapping).fillna(0.0)
+    return woe_df
+
+
+def monotonicity_check(bin_detail):
+    rows = []
+    for feature, group in bin_detail.groupby('feature', sort=False):
+        ordered = group.copy()
+        if 'bin_order' in ordered.columns:
+            ordered = ordered.sort_values('bin_order')
+        ordered = ordered.reset_index(drop=True)
+        variable_type = ordered.get('variable_type', pd.Series(['categorical'])).iloc[0]
+        if variable_type != 'numeric_continuous':
+            rows.append({
+                'feature': feature,
+                'bin_count': len(ordered),
+                'non_decreasing': False,
+                'non_increasing': False,
+                'monotonic_flag': False,
+                'bad_rate_path': '',
+                'reason': 'categorical feature has no natural order; skipped',
+            })
+            continue
+        regular = ordered[~ordered['bin_label'].isin(['MISSING', 'SPECIAL'])].reset_index(drop=True)
+        rates = regular['bad_rate'].astype(float).tolist()
+        non_decreasing = all(rates[i] <= rates[i + 1] + EPSILON for i in range(len(rates) - 1))
+        non_increasing = all(rates[i] + EPSILON >= rates[i + 1] for i in range(len(rates) - 1))
+        rows.append({
+            'feature': feature,
+            'bin_count': len(ordered),
+            'non_decreasing': non_decreasing,
+            'non_increasing': non_increasing,
+            'monotonic_flag': non_decreasing or non_increasing,
+            'bad_rate_path': ' -> '.join(['%.4f' % x for x in rates]),
+            'reason': '',
+        })
+    return pd.DataFrame(rows)
+
+
+def merge_log_for_non_monotonic(bin_detail):
+    check = monotonicity_check(bin_detail)
+    rows = []
+    for _, row in check[~check['monotonic_flag']].iterrows():
+        rows.append({'feature': row['feature'], 'issue': 'non_monotonic_bad_rate', 'bad_rate_path': row['bad_rate_path'], 'suggestion': 'merge adjacent bins or keep with business exception'})
+    return pd.DataFrame(rows)
+
+
+def enforce_monotonic_bins(df, binned, target, bin_rules, direction='auto', min_bins=3):
+    fixed = binned.copy()
+    updated_rules = dict((k, dict(v)) for k, v in bin_rules.items())
+    logs = []
+    for feature in fixed.columns:
+        if updated_rules.get(feature, {}).get('type') != 'numeric':
+            continue
+        while True:
+            detail = woe_iv_for_binned_feature(fixed[feature], target, feature).reset_index(drop=True)
+            regular = detail[~detail['bin_label'].isin(['MISSING', 'SPECIAL'])].reset_index(drop=True)
+            if len(regular) <= min_bins:
+                break
+            cut_points = list(updated_rules.get(feature, {}).get('cut_points', []))
+            if len(cut_points) != len(regular) - 1:
+                logs.append({'feature': feature, 'merged_from': '', 'removed_cut_point': '', 'reason': 'skip_cut_point_mismatch', 'direction': direction})
+                break
+            rates = regular['bad_rate'].astype(float).tolist()
+            if direction == 'auto':
+                trend = 'increasing' if rates[-1] >= rates[0] else 'decreasing'
+            else:
+                trend = direction
+            violations = []
+            for i in range(len(rates) - 1):
+                bad_order = (trend == 'increasing' and rates[i] > rates[i + 1] + EPSILON) or (trend == 'decreasing' and rates[i] + EPSILON < rates[i + 1])
+                if bad_order:
+                    violations.append((i, abs(rates[i] - rates[i + 1])))
+            if not violations:
+                break
+            merge_idx = sorted(violations, key=lambda x: x[1], reverse=True)[0][0]
+            left_label = regular.loc[merge_idx, 'bin_label']
+            right_label = regular.loc[merge_idx + 1, 'bin_label']
+            removed_cut_point = cut_points.pop(merge_idx)
+            updated_rules[feature]['cut_points'] = cut_points
+            fixed[feature] = apply_bin_rules(df[[feature]], {feature: updated_rules[feature]})[feature]
+            logs.append({'feature': feature, 'merged_from': '%s,%s' % (left_label, right_label), 'removed_cut_point': removed_cut_point, 'reason': 'monotonicity_violation', 'direction': trend})
+    return fixed, updated_rules, pd.DataFrame(logs)
+```
+
+## 阶段 3：PSI 与稳定性
+
+```python
+def psi_from_distribution(expected_dist, actual_dist):
+    all_bins = set(expected_dist.index).union(set(actual_dist.index))
+    value = 0.0
+    for b in all_bins:
+        e = float(expected_dist.get(b, 0.0)) + EPSILON
+        a = float(actual_dist.get(b, 0.0)) + EPSILON
+        value += (a - e) * np.log(a / e)
+    return float(value)
+
+
+def psi_by_bins(train_binned, oot_binned, feature_cols, test_binned=None):
+    summary_rows = []
+    detail_rows = []
+    for col in feature_cols:
+        train_dist = train_binned[col].astype(str).value_counts(normalize=True, dropna=False)
+        oot_dist = oot_binned[col].astype(str).value_counts(normalize=True, dropna=False)
+        train_oot_psi = psi_from_distribution(train_dist, oot_dist)
+        row = {'feature': col, 'train_oot_psi': train_oot_psi, 'psi': train_oot_psi, 'stable_flag': train_oot_psi <= 0.25}
+        test_dist = None
+        if test_binned is not None:
+            test_dist = test_binned[col].astype(str).value_counts(normalize=True, dropna=False)
+            row['train_test_psi'] = psi_from_distribution(train_dist, test_dist)
+            row['test_oot_psi'] = psi_from_distribution(test_dist, oot_dist)
+        summary_rows.append(row)
+        all_bins = set(train_dist.index).union(set(oot_dist.index))
+        if test_dist is not None:
+            all_bins = all_bins.union(set(test_dist.index))
+        for bin_label in sorted(all_bins):
+            train_pct = float(train_dist.get(bin_label, 0.0))
+            test_pct = float(test_dist.get(bin_label, 0.0)) if test_dist is not None else None
+            oot_pct = float(oot_dist.get(bin_label, 0.0))
+            detail_rows.append({'feature': col, 'bin_label': bin_label, 'train_pct': train_pct, 'test_pct': test_pct, 'oot_pct': oot_pct, 'train_oot_delta': oot_pct - train_pct, 'train_test_delta': None if test_pct is None else test_pct - train_pct, 'test_oot_delta': None if test_pct is None else oot_pct - test_pct})
+    return pd.DataFrame(summary_rows), pd.DataFrame(detail_rows)
+```
+
+PSI 必须优先基于训练集分箱规则后的分箱分布计算，而不是对 train/OOT 各自重新分箱。输出 `psi_table.csv` 记录 `train_oot_psi`；如传入 test 集，还要记录 `train_test_psi` 和 `test_oot_psi`。输出 `bin_psi_detail.csv` 定位具体漂移分箱。
+
+## 阶段 4：KS/AUC
+
+```python
+def ks_score(score, target):
+    temp = pd.DataFrame({'score': score, 'target': target}).dropna().sort_values('score')
+    total_bad = float(temp['target'].sum())
+    total_good = float(len(temp) - temp['target'].sum())
+    if total_bad == 0 or total_good == 0:
+        return np.nan
+    temp['cum_bad'] = temp['target'].cumsum() / total_bad
+    temp['cum_good'] = (1 - temp['target']).cumsum() / total_good
+    return float((temp['cum_bad'] - temp['cum_good']).abs().max())
+
+
+def feature_quality_from_woe(woe_df, target_s, iv_summary):
+    rows = []
+    iv_map = dict(zip(iv_summary['feature'], iv_summary['iv']))
+    for col in woe_df.columns:
+        score = woe_df[col].fillna(0.0)
+        try:
+            auc = roc_auc_score(target_s, score)
+        except Exception:
+            auc = np.nan
+        rows.append({'feature': col, 'iv': iv_map.get(col, 0.0), 'ks': ks_score(score, target_s), 'auc': auc})
+    return pd.DataFrame(rows).sort_values('iv', ascending=False)
+
+
+def feature_correlation(woe_df, iv_summary, threshold=0.7):
+    corr = woe_df.corr(method='spearman').abs()
+    iv_map = dict(zip(iv_summary['feature'], iv_summary['iv']))
+    rows = []
+    cols = list(corr.columns)
+    for i, left in enumerate(cols):
+        for right in cols[i + 1:]:
+            value = float(corr.loc[left, right])
+            if value >= threshold:
+                drop_feature = left if iv_map.get(left, 0.0) < iv_map.get(right, 0.0) else right
+                rows.append({'feature_left': left, 'feature_right': right, 'spearman_corr': value, 'suggest_drop': drop_feature, 'reason': 'high_correlation'})
+    return pd.DataFrame(rows)
+```
+
+## 阶段 5：决策树规则挖掘与 Graphviz 图片
+
+决策树输入必须优先使用分箱后的整数编码，而不是 WOE 值，保证树规则能还原为业务区间。数值分箱编码必须沿用有序分箱顺序；无序分类变量使用标签编码时，树分裂中的 `<=` 只表示编码集合切分，不代表类别有自然大小关系。规则解释必须通过 `decode_condition` 还原为类别集合，并提示该限制；高基数分类应先降维为 Top N + `OTHER`，如追求更高规则质量，可另行对比 OneHot 编码候选规则。每个叶子节点输出一条候选单规则，必须包含正负样本数、坏比例、触碰率、lift、编码规则和 `rule_readable` 业务可读规则。
+
+```python
+def label_encode_bins(binned, categorical_cols=None):
+    categorical_cols = set(categorical_cols or [])
+    encoded = pd.DataFrame(index=binned.index)
+    mappings = {}
+    for col in binned.columns:
+        variable_type = 'categorical' if col in categorical_cols else 'numeric_continuous'
+        if isinstance(binned[col].dtype, pd.CategoricalDtype) and binned[col].cat.ordered:
+            labels = [str(label) for label in binned[col].cat.categories if str(label) in set(binned[col].astype(str).tolist())]
+            variable_type = 'numeric_continuous'
+        else:
+            labels = sorted(binned[col].astype(str).unique().tolist())
+        mapping = dict((label, idx) for idx, label in enumerate(labels))
+        encoded[col] = binned[col].astype(str).map(mapping).astype(int)
+        mappings[col] = {
+            'variable_type': variable_type,
+            'label_to_code': mapping,
+            'code_to_label': dict((idx, label) for label, idx in mapping.items()),
+        }
+    return encoded, mappings
+
+
+def fit_rule_tree(train_x, train_y, max_depth=3, min_samples_leaf=0.03, min_samples_split=0.06):
+    n = len(train_y)
+    leaf_floor = max(30, int(min_samples_leaf * n)) if isinstance(min_samples_leaf, float) else max(30, int(min_samples_leaf))
+    split_floor = max(50, int(min_samples_split * n)) if isinstance(min_samples_split, float) else max(50, int(min_samples_split))
+    tree = DecisionTreeClassifier(
+        criterion='entropy',
+        max_depth=max_depth,
+        min_samples_leaf=leaf_floor,
+        min_samples_split=split_floor,
+        random_state=20260427,
+    )
+    tree.fit(train_x, train_y.astype(int))
+    return tree
+
+
+def tree_node_metrics(tree, node_id, total_count, overall_bad_rate):
+    sample = int(tree.tree_.n_node_samples[node_id])
+    class_values = tree.tree_.value[node_id][0]
+    value_sum = float(np.sum(class_values))
+    if abs(value_sum - 1.0) <= 1e-6:
+        good = int(round(sample * class_values[0]))
+        bad = int(round(sample * class_values[1])) if len(class_values) > 1 else 0
+    else:
+        good = int(round(class_values[0]))
+        bad = int(round(class_values[1])) if len(class_values) > 1 else 0
+    bad_rate = safe_rate(bad, good + bad)
+    hit_rate = safe_rate(sample, total_count)
+    return {'sample_count': sample, 'good_count': good, 'bad_count': bad, 'hit_rate': hit_rate, 'bad_rate': bad_rate, 'lift': safe_rate(bad_rate, overall_bad_rate)}
+
+
+def decode_condition(feature, operator, threshold, bin_mappings):
+    meta = bin_mappings.get(feature, {})
+    mapping = meta.get('code_to_label', {})
+    if not mapping:
+        return '%s %s %.6f' % (feature, operator, threshold)
+    if operator == '<=':
+        labels = [label for code, label in mapping.items() if code <= int(np.floor(threshold))]
+    else:
+        labels = [label for code, label in mapping.items() if code > int(np.floor(threshold))]
+    note = ' (categorical label-code split; no ordinal meaning)' if meta.get('variable_type') == 'categorical' else ''
+    return '%s in [%s]%s' % (feature, ', '.join([str(x) for x in labels]), note)
+
+
+def extract_tree_single_rules(tree, feature_names, train_y, bin_mappings=None):
+    bin_mappings = bin_mappings or {}
+    total_count = len(train_y)
+    overall_bad_rate = float(pd.Series(train_y).mean())
+    rows = []
+
+    def walk(node_id, path):
+        left_id = tree.tree_.children_left[node_id]
+        right_id = tree.tree_.children_right[node_id]
+        if left_id == _tree.TREE_LEAF and right_id == _tree.TREE_LEAF:
+            metrics = tree_node_metrics(tree, node_id, total_count, overall_bad_rate)
+            variables = sorted(set([p['feature'] for p in path]))
+            rule_expression = ' AND '.join([p['expr'] for p in path]) if path else 'ALL'
+            rule_readable = ' AND '.join([p['readable'] for p in path]) if path else 'ALL'
+            rows.append({
+                'rule_id': 'DT_R%05d' % (len(rows) + 1),
+                'node_id': int(node_id),
+                'rule_expression': rule_expression,
+                'rule_readable': rule_readable,
+                'rule_variables': ','.join(variables),
+                'variable_count': len(variables),
+                'sample_count': metrics['sample_count'],
+                'good_count': metrics['good_count'],
+                'bad_count': metrics['bad_count'],
+                'hit_rate': metrics['hit_rate'],
+                'bad_rate': metrics['bad_rate'],
+                'lift': metrics['lift'],
+                'overall_bad_rate': overall_bad_rate,
+            })
+            return
+        feature = feature_names[tree.tree_.feature[node_id]]
+        threshold = tree.tree_.threshold[node_id]
+        walk(left_id, path + [{'feature': feature, 'expr': '%s <= %.6f' % (feature, threshold), 'readable': decode_condition(feature, '<=', threshold, bin_mappings)}])
+        walk(right_id, path + [{'feature': feature, 'expr': '%s > %.6f' % (feature, threshold), 'readable': decode_condition(feature, '>', threshold, bin_mappings)}])
+
+    walk(0, [])
+    rules = pd.DataFrame(rows)
+    if len(rules):
+        rules = rules.sort_values(['lift', 'bad_rate', 'hit_rate'], ascending=[False, False, False]).reset_index(drop=True)
+    return rules
+
+
+def score_tree_rules_with_action(rules, min_hit_rate=0.01, min_bad_count=10, high_lift=2.0, medium_lift=1.5):
+    scored = rules.copy()
+    actions = []
+    confidences = []
+    for _, row in scored.iterrows():
+        if row['hit_rate'] >= 0.03 and row['bad_count'] >= 30 and row['lift'] >= high_lift:
+            actions.append('reject')
+            confidences.append('HIGH')
+        elif row['hit_rate'] >= min_hit_rate and row['bad_count'] >= min_bad_count and row['lift'] >= medium_lift:
+            actions.append('review')
+            confidences.append('MEDIUM')
+        else:
+            actions.append('pass_observe')
+            confidences.append('LOW')
+    scored['action'] = actions
+    scored['confidence'] = confidences
+    return scored
+
+
+def rule_overlap_matrix(rule_masks):
+    rule_ids = list(rule_masks.keys())
+    rows = []
+    for left in rule_ids:
+        row = {'rule_id': left}
+        left_mask = rule_masks[left]
+        left_count = int(left_mask.sum())
+        for right in rule_ids:
+            right_mask = rule_masks[right]
+            overlap = int((left_mask & right_mask).sum())
+            row[right] = safe_rate(overlap, left_count)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def render_tree_graphviz(tree, feature_names, train_y, output_prefix):
+    total_count = len(train_y)
+    overall_bad_rate = float(pd.Series(train_y).mean())
+    try:
+        import graphviz
+    except Exception as exc:
+        graphviz = None
+        print('graphviz import failed:', exc)
+    lines = ['digraph Tree {', 'node [shape=box, fontname="Microsoft YaHei"];']
+
+    def dot_escape(value):
+        return str(value).replace('\\', '\\\\').replace('"', '\\"')
+
+    def label(node_id):
+        m = tree_node_metrics(tree, node_id, total_count, overall_bad_rate)
+        return 'node=%s\\nsample=%s\\ngood=%s bad=%s\\nhit=%.2f%%\\nbad_rate=%.2f%%\\nlift=%.3f' % (
+            node_id, m['sample_count'], m['good_count'], m['bad_count'], m['hit_rate'] * 100, m['bad_rate'] * 100, m['lift'])
+
+    def walk(node_id):
+        lines.append('%s [label="%s"];' % (node_id, dot_escape(label(node_id))))
+        left_id = tree.tree_.children_left[node_id]
+        right_id = tree.tree_.children_right[node_id]
+        if left_id == _tree.TREE_LEAF and right_id == _tree.TREE_LEAF:
+            return
+        feature = feature_names[tree.tree_.feature[node_id]]
+        threshold = tree.tree_.threshold[node_id]
+        lines.append('%s -> %s [label="%s <= %.6f"];' % (node_id, left_id, dot_escape(feature), threshold))
+        lines.append('%s -> %s [label="%s > %.6f"];' % (node_id, right_id, dot_escape(feature), threshold))
+        walk(left_id)
+        walk(right_id)
+
+    walk(0)
+    lines.append('}')
+    dot_path = output_prefix + '.dot'
+    with open(dot_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    png_path = ''
+    if graphviz is not None:
+        try:
+            src = graphviz.Source('\n'.join(lines), format='png')
+            png_path = src.render(output_prefix, cleanup=True)
+        except Exception as exc:
+            print('graphviz png render failed:', exc)
+    return dot_path, png_path
+```
+
+## 阶段 6：规则模拟
+
+```python
+def build_rule_masks(df, rules):
+    masks = {}
+    for _, row in rules.iterrows():
+        expr = row['rule_expression']
+        if expr == 'ALL':
+            masks[row['rule_id']] = pd.Series(True, index=df.index)
+        else:
+            masks[row['rule_id']] = df.eval(expr.replace(' AND ', ' and '))
+    return masks
+
+
+def simulate_rule(df, mask, target, rule_id='', segment='ALL'):
+    total = len(df)
+    total_bad = int(df[target].sum())
+    hit = df.loc[mask]
+    hit_count = len(hit)
+    hit_bad = int(hit[target].sum()) if hit_count else 0
+    pass_df = df.loc[~mask]
+    pass_count = len(pass_df)
+    pass_bad = int(pass_df[target].sum()) if pass_count else 0
+    overall_bad_rate = safe_rate(total_bad, total)
+    hit_bad_rate = safe_rate(hit_bad, hit_count)
+    return {
+        'segment': segment,
+        'rule_id': rule_id,
+        'sample_count': total,
+        'bad_count': total_bad,
+        'overall_bad_rate': overall_bad_rate,
+        'hit_count': hit_count,
+        'hit_rate': safe_rate(hit_count, total),
+        'hit_bad_count': hit_bad,
+        'hit_bad_rate': hit_bad_rate,
+        'lift': safe_rate(hit_bad_rate, overall_bad_rate),
+        'pass_count': pass_count,
+        'pass_rate': safe_rate(pass_count, total),
+        'pass_bad_count': pass_bad,
+        'pass_bad_rate': safe_rate(pass_bad, pass_count),
+        'captured_bad_rate': safe_rate(hit_bad, total_bad),
+        'false_reject_good_count': hit_count - hit_bad,
+    }
+
+
+def simulate_combined_rules(df, rule_masks, target, selected_rule_ids=None, strategy_id='S001', segment='ALL'):
+    selected = selected_rule_ids or list(rule_masks.keys())
+    if not selected:
+        combined = pd.Series(False, index=df.index)
+    else:
+        combined = pd.Series(False, index=df.index)
+        for rule_id in selected:
+            combined = combined | rule_masks[rule_id]
+    result = simulate_rule(df, combined, target, rule_id=strategy_id, segment=segment)
+    result['strategy_id'] = strategy_id
+    result['rule_count'] = len(selected)
+    result['selected_rule_ids'] = ','.join(selected)
+    return result
+
+
+def optimize_strategy_rules(df, candidate_rules, rule_masks, target, max_reject_rate=0.2, max_pass_bad_rate=None):
+    selected = []
+    best_rows = []
+    ordered = candidate_rules.sort_values(['lift', 'bad_rate'], ascending=[False, False])
+    baseline_bad_rate = float(df[target].mean())
+    limit_pass_bad_rate = max_pass_bad_rate if max_pass_bad_rate is not None else baseline_bad_rate * 1.2
+    for _, rule in ordered.iterrows():
+        trial = selected + [rule['rule_id']]
+        sim = simulate_combined_rules(df, rule_masks, target, selected_rule_ids=trial, strategy_id='OPT')
+        if sim['hit_rate'] <= max_reject_rate and sim['pass_bad_rate'] <= limit_pass_bad_rate:
+            selected = trial
+            best_rows.append(sim)
+    return pd.DataFrame(best_rows)
+
+
+def assign_confidence(train_sim, oot_sim, psi_value=None, lift_tolerance=0.2):
+    train_lift = float(train_sim.get('lift', 0.0))
+    oot_lift = float(oot_sim.get('lift', 0.0))
+    lift_gap = abs(train_lift - oot_lift) / max(abs(train_lift), EPSILON)
+    pass_bad_gap = abs(float(train_sim.get('pass_bad_rate', 0.0)) - float(oot_sim.get('pass_bad_rate', 0.0)))
+    if lift_gap <= lift_tolerance and pass_bad_gap <= 0.02 and (psi_value is None or psi_value <= 0.1):
+        return 'HIGH'
+    if lift_gap <= 0.5 and (psi_value is None or psi_value <= 0.25):
+        return 'MEDIUM'
+    return 'LOW'
+
+
+def simulate_rules_by_month(df, target, time_col, rule_masks):
+    rows = []
+    for rule_id, mask in rule_masks.items():
+        rows.append(simulate_rule(df, mask, target, rule_id=rule_id, segment='ALL'))
+        if time_col:
+            for period, group in df.groupby(time_col):
+                rows.append(simulate_rule(group, mask.loc[group.index], target, rule_id=rule_id, segment=str(period)))
+    return pd.DataFrame(rows)
+
+
+def simulate_rules_by_segment(df, target, segment_cols, rule_masks):
+    rows = []
+    for rule_id, mask in rule_masks.items():
+        for segment_col in segment_cols:
+            if segment_col not in df.columns:
+                continue
+            for segment_value, group in df.groupby(segment_col):
+                rows.append(simulate_rule(group, mask.loc[group.index], target, rule_id=rule_id, segment='%s=%s' % (segment_col, segment_value)))
+    return pd.DataFrame(rows)
+```
+
+`optimize_strategy_rules` 在未传 `max_pass_bad_rate` 时默认使用 `baseline_bad_rate * 1.2` 作为通过样本坏账率容忍上限；实际使用时仍应按业务目标显式设置。
+
+规则模拟必须至少覆盖 train/test/oot 总体、按月、按关键客群/产品/渠道分层。常见分层字段包括渠道、产品、地区、客群类型、新老客、额度区间；如数据没有这些字段，必须在 `strategy_summary.md` 中说明无法分层验证的限制。
+
+## 阶段 8：上线监控计划
+
+上线前必须给出灰度与监控口径，不得只给离线规则结论。
+
+```python
+def build_monitoring_plan(rule_ids, rule_variables=None):
+    rule_variables = rule_variables or {}
+    rows = []
+    metrics = [
+        ('hit_rate', '规则触碰率', 'daily/monthly', 'relative_change_gt_30pct'),
+        ('bad_rate', '命中坏账率', 'monthly', 'relative_change_gt_30pct'),
+        ('pass_bad_rate', '通过样本坏账率', 'monthly', 'relative_change_gt_20pct'),
+        ('psi', '规则相关变量PSI', 'monthly', 'psi_gt_0.25'),
+        ('coverage_rate', '三方字段覆盖率', 'daily/monthly', 'relative_change_gt_20pct'),
+        ('reject_rate', '策略拒绝率', 'daily/monthly', 'relative_change_gt_20pct'),
+    ]
+    for rule_id in rule_ids:
+        for metric, meaning, frequency, alert_rule in metrics:
+            rows.append({'rule_id': rule_id, 'metric': metric, 'meaning': meaning, 'frequency': frequency, 'alert_rule': alert_rule})
+        for feature in rule_variables.get(rule_id, []):
+            rows.append({'rule_id': rule_id, 'feature': feature, 'metric': 'missing_rate', 'meaning': '规则变量缺失率', 'frequency': 'daily/monthly', 'alert_rule': 'relative_change_gt_20pct'})
+            rows.append({'rule_id': rule_id, 'feature': feature, 'metric': 'bin_psi', 'meaning': '规则变量分箱PSI', 'frequency': 'monthly', 'alert_rule': 'psi_gt_0.25'})
+            rows.append({'rule_id': rule_id, 'feature': feature, 'metric': 'top1_rate', 'meaning': '规则变量TOP1占比', 'frequency': 'monthly', 'alert_rule': 'relative_change_gt_20pct'})
+    return pd.DataFrame(rows)
+```
+
+## 总结报告模板
+
+`strategy_summary.md` 必须包含：
+
+1. 样本口径：时间窗、样本数、坏账定义、坏账率、排除字段。
+2. 字段审计结论：字段可得性、泄露字段、不可稳定供应字段、剔除原因。
+3. 数据质量结论：可用变量数、剔除变量数、主要剔除原因。
+4. 变量有效性：TOP 变量、IV/KS/AUC、稳定性、单调性、泄露排查。
+5. 候选规则：规则条数、强拒绝/审核/观察数量、置信等级分布、规则重叠情况。
+6. 模拟结果：单规则和策略级拒绝率、通过率、命中坏样本占比、通过样本坏账率变化、按月和分层稳定性。
+7. 上线建议：建议上线、灰度、观察或废弃；必须引用 `rule_id` 和 `evidence_id`。
+8. 监控计划：上线后命中率、坏账率、通过坏账率、PSI、覆盖率、拒绝率的监控频率和预警阈值。
+9. 风险提示：样本偏差、变量含义不确定、跨期波动、客群/渠道差异、合规风险。
+
+## 最终交付清单
+
+推荐输出目录：
+
+```text
+run_config.json
+environment.json
+sample_profile.csv
+sample_split_log.csv
+field_audit.csv
+leakage_audit.csv
+data_detect.csv
+data_quality.csv
+outlier_summary.csv
+feature_quality.csv
+feature_drop_reason.csv
+bin_rules.json
+bin_detail.csv
+woe_rules.json
+monotonicity_check.csv
+bin_merge_log.csv
+psi_table.csv
+bin_psi_detail.csv
+feature_correlation.csv
+decision_tree.dot
+decision_tree.png
+decision_tree_rules.csv
+single_rule_candidates.csv
+rule_overlap_matrix.csv
+strategy_rules.csv
+rule_simulation.csv
+strategy_level_simulation.csv
+monthly_rule_simulation.csv
+segment_rule_simulation.csv
+strategy_comparison.csv
+confidence_evidence.csv
+decision_log.csv
+monitoring_plan.csv
+strategy_summary.md
+```
+
+## 禁止事项
+
+- 不得使用贷后字段、结果字段、人工审批结论等泄露变量。
+- 不得只凭 IV、单期坏账率或单个 lift 制定拒绝规则。
+- 不得上线样本占比过小、坏样本数过少、跨期不稳定的强拒绝规则。
+- 不得隐藏剔除原因、调箱原因、规则阈值来源或模拟不利结果。
+- 不得依赖 toad。
+- 不得只输出决策树图片而不输出单规则表。
+- 不得让图中节点缺失正负样本数、触碰率、坏比例或 lift。
+- 不得在未完成字段泄露审计、OOT/按月验证、分层模拟和监控计划时给出上线建议。
+- 不得用 WOE 数值作为业务规则表达式；决策树规则必须能还原为分箱标签或业务区间。
+- 不得对 train/OOT 分别重新分箱后计算 PSI；必须复用训练集分箱规则。
