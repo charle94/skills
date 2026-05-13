@@ -52,13 +52,16 @@ PY
 |---|---|---|---|---|
 | 0. 口径与环境 | 固化样本、字段、版本、train/test/OOT 划分 | 环境检查、`split_samples` | `run_config.json`, `environment.json`, `sample_profile.csv`, `sample_split_log.csv` | 目标字段二分类，版本可运行，`sample_type` 已固化 |
 | 0.5 字段可得性与泄露审计 | 排除贷后、结果、人工审批、不可稳定获取字段 | pandas 字段字典审计 | `field_audit.csv`, `leakage_audit.csv` | 字段可得时间早于审批决策，泄露风险可控 |
-| 1. 数据质量 | 判断字段可用性 | pandas describe/value_counts | `data_quality.csv`, `outlier_summary.csv` | 覆盖率、唯一值、异常值可解释 |
+| 1. 数据质量 | 判断字段可用性 | pandas describe/value_counts | `data_quality.csv`, `outlier_summary.csv`, `feature_drop_reason.csv` | 覆盖率、唯一值、异常值可解释 |
 | 2. 分箱与 WOE/IV | 建立可解释风险区间并计算 IV | pandas qcut/cut/groupby, WOE/IV | `bin_detail.csv`, `bin_rules.json`, `woe_rules.json`, `monotonicity_check.csv`, `bin_merge_log.csv` | 分箱样本充足、可复用，WOE/IV 有证据 |
-| 3. PSI 与稳定性 | 评估 train/test/OOT 分箱分布漂移 | 分箱分布 PSI | `psi_table.csv`, `bin_psi_detail.csv` | train/test/OOT 漂移可解释 |
+| 3. PSI 与稳定性 | 评估 train/test/OOT 分箱分布漂移 | 分箱分布 PSI | `psi_table.csv`, `bin_psi_detail.csv` | train/test/OOT 漂移可解释，不稳定变量已剔除或注明 |
 | 4. KS/AUC 变量有效性 | 评估变量区分能力 | sklearn metrics | `feature_quality.csv`, `feature_correlation.csv` | IV/KS/AUC 有证据，排除泄露和冗余 |
-| 5. 规则挖掘 | 使用决策树生成候选单规则 | `DecisionTreeClassifier`, `graphviz` | `decision_tree_rules.csv`, `single_rule_candidates.csv`, `decision_tree.png`, `rule_overlap_matrix.csv` | 节点正负样本、触碰率、坏比例、lift、规则路径清晰 |
+| 5. 决策树规则挖掘 | 使用决策树生成候选多变量组合规则 | `DecisionTreeClassifier`, `graphviz` | `decision_tree_rules.csv`, `decision_tree.png`, `rule_overlap_matrix.csv` | 节点正负样本、触碰率、坏比例、lift、规则路径清晰 |
+| 5.1 单变量规则挖掘与评估 | 从分箱切点提取单变量候选规则，跨集评估稳定性 | `bin_detail` + `build_bin_masks` | `single_rule_candidates.csv`, `single_var_rule_eval.csv` | 每条规则命中率/坏样本数/lift 达标，train/test/OOT lift 方向一致 |
+| 5.2 多规则组合挖掘 | 枚举候选规则 OR 组合，筛选帕累托最优组合 | `itertools.combinations` + pandas mask | `rule_combination_candidates.csv` | 联合命中率/通过坏账率在业务约束范围内 |
 | 6. 策略制定与模拟 | 选择动作、阈值并评估业务影响 | 业务约束 + pandas mask | `strategy_rules.csv`, `strategy_comparison.csv`, `rule_simulation.csv`, `strategy_level_simulation.csv`, `monthly_rule_simulation.csv`, `segment_rule_simulation.csv` | train/test/OOT 表现一致或差异有解释 |
-| 7. 总结评审 | 可追溯结论 | 证据汇总 | `strategy_summary.md`, `confidence_evidence.csv` | 每条结论可追溯到数据和规则证据 |
+| 6.1 瀑布流评估 | 按优先级顺序叠加规则，评估每步增量效果与跨期稳定性 | 累积 OR mask + `waterfall_cross_set` | `waterfall_simulation.csv`, `waterfall_comparison.csv` | 每步增量 lift/命中率与 train/OOT 方向一致，边际收益不为负 |
+| 7. 总结评审 | 可追溯结论 | 证据汇总 | `strategy_summary.md`, `confidence_evidence.csv` | 每条结论可追溯到数据和规则证据，train/test/oot 三列值均填写 |
 | 8. 上线监控 | 固化灰度与监控阈值 | 指标阈值表 | `monitoring_plan.csv` | 命中率、坏账率、PSI、覆盖率、拒绝率监控口径明确 |
 
 ## 置信与可追溯要求
@@ -103,6 +106,8 @@ from sklearn.tree import DecisionTreeClassifier, _tree
 
 
 EPSILON = 1e-10
+PSI_STABLE_THRESHOLD = 0.1
+PSI_WATCH_THRESHOLD = 0.25
 
 
 def ensure_dir(path):
@@ -121,6 +126,22 @@ def safe_rate(num, den):
 
 def now_text():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def log_decision(log_path, stage, object_id, decision, reason, input_files='', output_files='', operator_note=''):
+    """Append one decision row to decision_log.csv (create if not exists)."""
+    row = pd.DataFrame([{
+        'timestamp': now_text(),
+        'stage': stage,
+        'object_id': str(object_id),
+        'decision': decision,
+        'reason': reason,
+        'input_files': input_files,
+        'output_files': output_files,
+        'operator_note': operator_note,
+    }])
+    write_header = not os.path.exists(log_path)
+    row.to_csv(log_path, mode='a', index=False, header=write_header, encoding='utf-8')
 ```
 
 ## 阶段 0：样本口径
@@ -439,6 +460,14 @@ def apply_woe_transform(binned, bin_detail):
     return woe_df
 
 
+def woe_rules_to_json(bin_detail):
+    """Serialize bin_detail WOE mapping to woe_rules.json structure: {feature: {bin_label: woe}}."""
+    result = {}
+    for feature, group in bin_detail.groupby('feature'):
+        result[str(feature)] = {str(bl): float(w) for bl, w in zip(group['bin_label'], group['woe'])}
+    return result
+
+
 def monotonicity_check(bin_detail):
     rows = []
     for feature, group in bin_detail.groupby('feature', sort=False):
@@ -451,9 +480,9 @@ def monotonicity_check(bin_detail):
             rows.append({
                 'feature': feature,
                 'bin_count': len(ordered),
-                'non_decreasing': False,
-                'non_increasing': False,
-                'monotonic_flag': False,
+                'non_decreasing': None,
+                'non_increasing': None,
+                'monotonic_flag': None,
                 'bad_rate_path': '',
                 'reason': 'categorical feature has no natural order; skipped',
             })
@@ -477,7 +506,7 @@ def monotonicity_check(bin_detail):
 def merge_log_for_non_monotonic(bin_detail):
     check = monotonicity_check(bin_detail)
     rows = []
-    for _, row in check[~check['monotonic_flag']].iterrows():
+    for _, row in check[check['monotonic_flag'] == False].iterrows():
         rows.append({'feature': row['feature'], 'issue': 'non_monotonic_bad_rate', 'bad_rate_path': row['bad_rate_path'], 'suggestion': 'merge adjacent bins or keep with business exception'})
     return pd.DataFrame(rows)
 
@@ -540,7 +569,8 @@ def psi_by_bins(train_binned, oot_binned, feature_cols, test_binned=None):
         train_dist = train_binned[col].astype(str).value_counts(normalize=True, dropna=False)
         oot_dist = oot_binned[col].astype(str).value_counts(normalize=True, dropna=False)
         train_oot_psi = psi_from_distribution(train_dist, oot_dist)
-        row = {'feature': col, 'train_oot_psi': train_oot_psi, 'psi': train_oot_psi, 'stable_flag': train_oot_psi <= 0.25}
+        psi_level = 'stable' if train_oot_psi < PSI_STABLE_THRESHOLD else ('watch' if train_oot_psi <= PSI_WATCH_THRESHOLD else 'unstable')
+        row = {'feature': col, 'train_oot_psi': train_oot_psi, 'psi': train_oot_psi, 'psi_level': psi_level}
         test_dist = None
         if test_binned is not None:
             test_dist = test_binned[col].astype(str).value_counts(normalize=True, dropna=False)
@@ -599,6 +629,39 @@ def feature_correlation(woe_df, iv_summary, threshold=0.7):
                 drop_feature = left if iv_map.get(left, 0.0) < iv_map.get(right, 0.0) else right
                 rows.append({'feature_left': left, 'feature_right': right, 'spearman_corr': value, 'suggest_drop': drop_feature, 'reason': 'high_correlation'})
     return pd.DataFrame(rows)
+
+
+def build_feature_drop_reason(quality_df=None, leakage_df=None, corr_df=None, psi_df=None, manual_drops=None):
+    """Aggregate drop reasons from all stages into feature_drop_reason.csv.
+
+    quality_df : output of data_quality()
+    leakage_df : output of audit_fields()
+    corr_df    : output of feature_correlation()
+    psi_df     : summary output of psi_by_bins()
+    manual_drops: list of {'feature': ..., 'reason': ...}
+    """
+    rows = []
+    if quality_df is not None:
+        for _, r in quality_df.iterrows():
+            if r.get('is_constant'):
+                rows.append({'feature': r['feature'], 'drop_stage': 'data_quality', 'drop_reason': 'constant_feature'})
+            elif float(r.get('missing_rate', 0)) >= 0.9:
+                rows.append({'feature': r['feature'], 'drop_stage': 'data_quality', 'drop_reason': 'missing_rate_ge_90pct'})
+    if leakage_df is not None:
+        for _, r in leakage_df[leakage_df.get('decision', pd.Series(dtype=str)) == 'drop'].iterrows():
+            kw = str(r.get('keyword_hit', ''))
+            reason = kw if kw else ('time_leakage' if r.get('time_leakage_flag') else 'post_loan_field')
+            rows.append({'feature': r['feature'], 'drop_stage': 'leakage_audit', 'drop_reason': reason})
+    if corr_df is not None:
+        for _, r in corr_df.iterrows():
+            keep = r['feature_left'] if r['suggest_drop'] == r['feature_right'] else r['feature_right']
+            rows.append({'feature': r['suggest_drop'], 'drop_stage': 'correlation', 'drop_reason': 'high_corr_with_%s_spearman=%.3f' % (keep, r['spearman_corr'])})
+    if psi_df is not None and 'psi_level' in psi_df.columns:
+        for _, r in psi_df[psi_df['psi_level'] == 'unstable'].iterrows():
+            rows.append({'feature': r['feature'], 'drop_stage': 'psi_stability', 'drop_reason': 'psi_unstable_%.4f' % float(r.get('train_oot_psi', 0))})
+    for item in (manual_drops or []):
+        rows.append({'feature': item['feature'], 'drop_stage': 'manual', 'drop_reason': item.get('reason') or 'manual_exclude_reason_required'})
+    return pd.DataFrame(rows)
 ```
 
 ## 阶段 5：决策树规则挖掘与 Graphviz 图片
@@ -607,24 +670,46 @@ def feature_correlation(woe_df, iv_summary, threshold=0.7):
 
 ```python
 def label_encode_bins(binned, categorical_cols=None):
+    """Encode binned frame to integers for decision-tree input.
+
+    For ordered numeric Categoricals the encoding preserves bin order.
+    Labels are always taken from the full cat.categories (not filtered by
+    what is present in the current slice) so that train/test/OOT encodings
+    are identical. Unknown labels are encoded as -1.
+    """
     categorical_cols = set(categorical_cols or [])
     encoded = pd.DataFrame(index=binned.index)
     mappings = {}
     for col in binned.columns:
         variable_type = 'categorical' if col in categorical_cols else 'numeric_continuous'
         if isinstance(binned[col].dtype, pd.CategoricalDtype) and binned[col].cat.ordered:
-            labels = [str(label) for label in binned[col].cat.categories if str(label) in set(binned[col].astype(str).tolist())]
+            labels = [str(label) for label in binned[col].cat.categories]
             variable_type = 'numeric_continuous'
         else:
             labels = sorted(binned[col].astype(str).unique().tolist())
-        mapping = dict((label, idx) for idx, label in enumerate(labels))
-        encoded[col] = binned[col].astype(str).map(mapping).astype(int)
+        mapping = {label: idx for idx, label in enumerate(labels)}
+        encoded[col] = binned[col].astype(str).map(mapping).fillna(-1).astype(int)
         mappings[col] = {
             'variable_type': variable_type,
             'label_to_code': mapping,
-            'code_to_label': dict((idx, label) for label, idx in mapping.items()),
+            'code_to_label': {idx: label for label, idx in mapping.items()},
         }
     return encoded, mappings
+
+
+def apply_label_encode(binned, mappings):
+    """Apply pre-built label-encode mappings (from label_encode_bins) to a new binned frame.
+
+    Use this for test/OOT frames so their integer codes are consistent with the
+    training mappings.  Labels absent from the original mapping are encoded as -1.
+    """
+    encoded = pd.DataFrame(index=binned.index)
+    for col, meta in mappings.items():
+        if col not in binned.columns:
+            continue
+        mapping = meta.get('label_to_code', {})
+        encoded[col] = binned[col].astype(str).map(mapping).fillna(-1).astype(int)
+    return encoded
 
 
 def fit_rule_tree(train_x, train_y, max_depth=3, min_samples_leaf=0.03, min_samples_split=0.06):
@@ -643,15 +728,17 @@ def fit_rule_tree(train_x, train_y, max_depth=3, min_samples_leaf=0.03, min_samp
 
 
 def tree_node_metrics(tree, node_id, total_count, overall_bad_rate):
+    """Compute per-node metrics from a fitted DecisionTreeClassifier.
+
+    sklearn stores raw sample counts (not probabilities) in tree_.value when
+    sample_weight is not used.  We read them directly without the
+    value_sum == 1.0 heuristic which breaks for sample_count == 1 or when
+    sample_weight is provided.
+    """
     sample = int(tree.tree_.n_node_samples[node_id])
     class_values = tree.tree_.value[node_id][0]
-    value_sum = float(np.sum(class_values))
-    if abs(value_sum - 1.0) <= 1e-6:
-        good = int(round(sample * class_values[0]))
-        bad = int(round(sample * class_values[1])) if len(class_values) > 1 else 0
-    else:
-        good = int(round(class_values[0]))
-        bad = int(round(class_values[1])) if len(class_values) > 1 else 0
+    good = int(round(class_values[0]))
+    bad = int(round(class_values[1])) if len(class_values) > 1 else 0
     bad_rate = safe_rate(bad, good + bad)
     hit_rate = safe_rate(sample, total_count)
     return {'sample_count': sample, 'good_count': good, 'bad_count': bad, 'hit_rate': hit_rate, 'bad_rate': bad_rate, 'lift': safe_rate(bad_rate, overall_bad_rate)}
@@ -792,17 +879,153 @@ def render_tree_graphviz(tree, feature_names, train_y, output_prefix):
     return dot_path, png_path
 ```
 
+## 阶段 5.1：单变量规则挖掘与评估
+
+从 `bin_detail` 每个分箱直接提取单变量候选规则，不依赖决策树。每条规则代表"变量落入某分箱"。必须通过 `build_bin_masks` 基于 binned frame 构建掩码（而非 `df.eval`），在 train/test/OOT 上分别评估，输出 `single_rule_candidates.csv`（含训练集指标）和 `single_var_rule_eval.csv`（含跨集指标）。
+
+```python
+def extract_single_var_rules(df_train, binned_train, target, feature_cols, bin_detail):
+    """从 bin_detail 提取单变量候选规则，输出字段与决策树规则表对齐。"""
+    total = len(df_train)
+    total_bad = int(df_train[target].sum())
+    overall_bad_rate = safe_rate(total_bad, total)
+    rows = []
+    counter = [0]
+    for feature in feature_cols:
+        feat_detail = bin_detail[bin_detail['feature'] == feature]
+        for _, bin_row in feat_detail.iterrows():
+            counter[0] += 1
+            bin_label = str(bin_row['bin_label'])
+            rows.append({
+                'rule_id': 'SV_R%05d' % counter[0],
+                'source': 'single_var',
+                'feature': feature,
+                'bin_label': bin_label,
+                'rule_readable': '%s in [%s]' % (feature, bin_label),
+                'rule_variables': feature,
+                'variable_count': 1,
+                'sample_count': int(bin_row.get('sample_count', 0)),
+                'good_count': int(bin_row.get('good_count', 0)),
+                'bad_count': int(bin_row.get('bad_count', 0)),
+                'hit_rate': float(bin_row.get('sample_rate', 0.0)),
+                'bad_rate': float(bin_row.get('bad_rate', 0.0)),
+                'lift': float(bin_row.get('lift', 0.0)),
+                'overall_bad_rate': overall_bad_rate,
+                'woe': float(bin_row.get('woe', 0.0)),
+                'iv_component': float(bin_row.get('iv_component', 0.0)),
+            })
+    return pd.DataFrame(rows)
+
+
+def build_bin_masks(binned, single_var_rules):
+    """Build rule masks from a binned frame (avoids df.eval column-name issues).
+
+    Each mask is True where the feature's bin label equals the rule's bin_label.
+    """
+    masks = {}
+    for _, row in single_var_rules.iterrows():
+        feature = row['feature']
+        bin_label = str(row['bin_label'])
+        if feature in binned.columns:
+            masks[row['rule_id']] = binned[feature].astype(str) == bin_label
+        else:
+            masks[row['rule_id']] = pd.Series(False, index=binned.index)
+    return masks
+
+
+def filter_rule_candidates(rules, min_hit_rate=0.01, min_bad_count=10, min_lift=1.5, max_bad_rate=None):
+    """Filter candidate rules by minimum quality thresholds."""
+    mask = (
+        (rules['hit_rate'] >= min_hit_rate) &
+        (rules['bad_count'] >= min_bad_count) &
+        (rules['lift'] >= min_lift)
+    )
+    if max_bad_rate is not None:
+        mask = mask & (rules['bad_rate'] <= max_bad_rate)
+    return rules[mask].reset_index(drop=True)
+
+
+def evaluate_single_var_rules_cross_set(df, binned, single_var_rules, target, sample_type_col='sample_type'):
+    """Evaluate each single-variable rule on train/test/oot separately.
+
+    Returns single_var_rule_eval.csv with columns:
+      rule_id, segment, hit_rate, bad_rate, lift, pass_bad_rate,
+      hit_count, bad_count, sample_count.
+    """
+    masks = build_bin_masks(binned, single_var_rules)
+    rows = []
+    for seg in ['train', 'test', 'oot']:
+        if sample_type_col in df.columns:
+            sub_df = df[df[sample_type_col] == seg]
+            sub_binned = binned.loc[sub_df.index]
+        else:
+            sub_df = df
+            sub_binned = binned
+        sub_masks = {rid: masks[rid].loc[sub_df.index] for rid in masks if rid in masks}
+        for rule_id, mask in sub_masks.items():
+            sim = simulate_rule(sub_df, mask, target, rule_id=rule_id, segment=seg)
+            rows.append(sim)
+    return pd.DataFrame(rows)
+```
+
+## 阶段 5.2：多规则组合挖掘
+
+在单变量规则和决策树规则筛选出候选集后，枚举 `top_n` 条规则的两两（或三三）OR 组合，评估联合命中率、坏账率和 lift，输出 `rule_combination_candidates.csv`。组合规则动作仍以 `simulate_combined_rules` 评估，不另行修改分箱。
+
+```python
+def mine_rule_combinations(df, candidate_rule_ids, rule_masks, target,
+                           max_combo_size=2, top_n=20,
+                           min_hit_rate=0.01, min_bad_count=10, min_lift=1.2):
+    """Enumerate OR combinations of top_n candidate rules up to max_combo_size.
+
+    Returns rule_combination_candidates.csv sorted by lift descending.
+    """
+    from itertools import combinations as _combinations
+    candidates = candidate_rule_ids[:top_n]
+    rows = []
+    counter = [0]
+    for combo_size in range(2, max_combo_size + 1):
+        for combo in _combinations(candidates, combo_size):
+            counter[0] += 1
+            combined = pd.Series(False, index=df.index)
+            for rid in combo:
+                if rid in rule_masks:
+                    combined = combined | rule_masks[rid]
+            sim = simulate_rule(df, combined, target,
+                                rule_id='COMBO_%05d' % counter[0], segment='ALL')
+            sim['combo_rule_ids'] = ','.join(combo)
+            sim['combo_size'] = combo_size
+            rows.append(sim)
+    result = pd.DataFrame(rows)
+    if len(result):
+        result = result[
+            (result['hit_rate'] >= min_hit_rate) &
+            (result['hit_bad_count'] >= min_bad_count) &
+            (result['lift'] >= min_lift)
+        ].sort_values(['lift', 'bad_rate'], ascending=[False, False]).reset_index(drop=True)
+    return result
+```
+
 ## 阶段 6：规则模拟
 
 ```python
 def build_rule_masks(df, rules):
+    """Build boolean masks for decision-tree rules using df.eval.
+
+    IMPORTANT: rule_expression column names must be valid Python identifiers
+    (no spaces, no special characters) — guaranteed when using label_encode_bins
+    output as the df.  Single-variable rules should use build_bin_masks instead.
+    """
     masks = {}
     for _, row in rules.iterrows():
         expr = row['rule_expression']
         if expr == 'ALL':
             masks[row['rule_id']] = pd.Series(True, index=df.index)
         else:
-            masks[row['rule_id']] = df.eval(expr.replace(' AND ', ' and '))
+            try:
+                masks[row['rule_id']] = df.eval(expr.replace(' AND ', ' and '))
+            except Exception:
+                masks[row['rule_id']] = pd.Series(False, index=df.index)
     return masks
 
 
@@ -853,8 +1076,18 @@ def simulate_combined_rules(df, rule_masks, target, selected_rule_ids=None, stra
 
 
 def optimize_strategy_rules(df, candidate_rules, rule_masks, target, max_reject_rate=0.2, max_pass_bad_rate=None):
+    """Greedily select rules that maximise lift while satisfying reject-rate and pass-bad-rate constraints.
+
+    Returns
+    -------
+    strategy_rules_df : DataFrame
+        strategy_rules.csv — one row per selected rule (rule_id, action, confidence,
+        rule_readable, rule_variables).
+    simulation_df : DataFrame
+        Simulation result after adding each rule cumulatively (strategy_comparison.csv basis).
+    """
     selected = []
-    best_rows = []
+    sim_rows = []
     ordered = candidate_rules.sort_values(['lift', 'bad_rate'], ascending=[False, False])
     baseline_bad_rate = float(df[target].mean())
     limit_pass_bad_rate = max_pass_bad_rate if max_pass_bad_rate is not None else baseline_bad_rate * 1.2
@@ -863,8 +1096,20 @@ def optimize_strategy_rules(df, candidate_rules, rule_masks, target, max_reject_
         sim = simulate_combined_rules(df, rule_masks, target, selected_rule_ids=trial, strategy_id='OPT')
         if sim['hit_rate'] <= max_reject_rate and sim['pass_bad_rate'] <= limit_pass_bad_rate:
             selected = trial
-            best_rows.append(sim)
-    return pd.DataFrame(best_rows)
+            sim_rows.append(sim)
+    strategy_rows = []
+    rules_map = candidate_rules.set_index('rule_id')
+    for rid in selected:
+        r = rules_map.loc[rid] if rid in rules_map.index else {}
+        strategy_rows.append({
+            'strategy_id': 'OPT',
+            'rule_id': rid,
+            'action': r.get('action', 'reject'),
+            'confidence': r.get('confidence', ''),
+            'rule_readable': r.get('rule_readable', ''),
+            'rule_variables': r.get('rule_variables', r.get('feature', '')),
+        })
+    return pd.DataFrame(strategy_rows), pd.DataFrame(sim_rows)
 
 
 def assign_confidence(train_sim, oot_sim, psi_value=None, lift_tolerance=0.2):
@@ -872,9 +1117,9 @@ def assign_confidence(train_sim, oot_sim, psi_value=None, lift_tolerance=0.2):
     oot_lift = float(oot_sim.get('lift', 0.0))
     lift_gap = abs(train_lift - oot_lift) / max(abs(train_lift), EPSILON)
     pass_bad_gap = abs(float(train_sim.get('pass_bad_rate', 0.0)) - float(oot_sim.get('pass_bad_rate', 0.0)))
-    if lift_gap <= lift_tolerance and pass_bad_gap <= 0.02 and (psi_value is None or psi_value <= 0.1):
+    if lift_gap <= lift_tolerance and pass_bad_gap <= 0.02 and (psi_value is None or psi_value <= PSI_STABLE_THRESHOLD):
         return 'HIGH'
-    if lift_gap <= 0.5 and (psi_value is None or psi_value <= 0.25):
+    if lift_gap <= 0.5 and (psi_value is None or psi_value <= PSI_WATCH_THRESHOLD):
         return 'MEDIUM'
     return 'LOW'
 
@@ -900,7 +1145,135 @@ def simulate_rules_by_segment(df, target, segment_cols, rule_masks):
     return pd.DataFrame(rows)
 ```
 
-`optimize_strategy_rules` 在未传 `max_pass_bad_rate` 时默认使用 `baseline_bad_rate * 1.2` 作为通过样本坏账率容忍上限；实际使用时仍应按业务目标显式设置。
+`optimize_strategy_rules` 返回 `(strategy_rules_df, simulation_df)` 两个 DataFrame：前者对应 `strategy_rules.csv`，后者记录每步累加后的模拟结果；在未传 `max_pass_bad_rate` 时默认使用 `baseline_bad_rate * 1.2` 作为通过样本坏账率容忍上限，实际使用时应按业务目标显式设置。
+
+## 阶段 6.1：瀑布流评估
+
+按业务优先级顺序顺序叠加规则，每步计算当前策略总体指标及该步新增的增量命中与增量坏样本。必须在 train/test/OOT 三个集合上分别执行并合并输出，便于对比跨期一致性。若某步 OOT 增量 lift 明显低于 train，需在 `decision_log.csv` 记录风险并在 `strategy_summary.md` 说明。
+
+```python
+def build_waterfall_simulation(df, ordered_rule_ids, rule_masks, target,
+                               strategy_id_prefix='WF', segment='ALL'):
+    """Sequential cumulative waterfall: add rules one by one, record incremental gain.
+
+    Each row represents the combined strategy after adding one more rule.
+    Extra columns: waterfall_step, added_rule_id, cumulative_rule_ids,
+    incremental_hit, incremental_bad, incremental_hit_rate,
+    incremental_captured_bad_rate.
+    """
+    rows = []
+    cumulative = pd.Series(False, index=df.index)
+    prev_hit = 0
+    prev_bad = 0
+    total_bad = int(df[target].sum())
+    for step, rule_id in enumerate(ordered_rule_ids):
+        if rule_id not in rule_masks:
+            continue
+        cumulative = cumulative | rule_masks[rule_id]
+        strategy_id = '%s_S%02d_%s' % (strategy_id_prefix, step + 1, rule_id)
+        sim = simulate_rule(df, cumulative, target, rule_id=strategy_id, segment=segment)
+        sim['waterfall_step'] = step + 1
+        sim['added_rule_id'] = rule_id
+        sim['cumulative_rule_ids'] = ','.join(ordered_rule_ids[:step + 1])
+        sim['incremental_hit'] = sim['hit_count'] - prev_hit
+        sim['incremental_bad'] = sim['hit_bad_count'] - prev_bad
+        sim['incremental_hit_rate'] = safe_rate(sim['incremental_hit'], sim['sample_count'])
+        sim['incremental_captured_bad_rate'] = safe_rate(sim['incremental_bad'], total_bad)
+        rows.append(sim)
+        prev_hit = sim['hit_count']
+        prev_bad = sim['hit_bad_count']
+    return pd.DataFrame(rows)
+
+
+def waterfall_cross_set(df, ordered_rule_ids, rule_masks, target, sample_type_col='sample_type'):
+    """Run build_waterfall_simulation on train/test/oot and concat results.
+
+    Output: waterfall_comparison.csv — use waterfall_step + added_rule_id + segment
+    to compare incremental lift stability across sets.
+    """
+    frames = []
+    for seg in ['train', 'test', 'oot']:
+        if sample_type_col in df.columns:
+            sub_df = df[df[sample_type_col] == seg]
+        else:
+            sub_df = df
+        sub_masks = {rid: rule_masks[rid].loc[sub_df.index]
+                     for rid in ordered_rule_ids if rid in rule_masks}
+        wf = build_waterfall_simulation(sub_df, ordered_rule_ids, sub_masks, target, segment=seg)
+        frames.append(wf)
+    return pd.concat(frames, ignore_index=True)
+```
+
+## 阶段 7：总结评审与可追溯证据
+
+```python
+def build_strategy_rules_table(selected_rule_ids, rules_df, strategy_id='S001', default_action='reject'):
+    """Build strategy_rules.csv: one row per rule in the final strategy."""
+    rules_map = rules_df.set_index('rule_id') if len(rules_df) else pd.DataFrame()
+    rows = []
+    for rid in selected_rule_ids:
+        r = rules_map.loc[rid] if (len(rules_map) and rid in rules_map.index) else {}
+        rows.append({
+            'strategy_id': strategy_id,
+            'rule_id': rid,
+            'action': r.get('action', default_action),
+            'confidence': r.get('confidence', ''),
+            'rule_readable': r.get('rule_readable', ''),
+            'rule_variables': r.get('rule_variables', r.get('feature', '')),
+        })
+    return pd.DataFrame(rows)
+
+
+def compare_strategy_simulations(before_sim, after_sim,
+                                  strategy_id_before='before', strategy_id_after='after'):
+    """Compare two strategy simulation dicts/rows for strategy_comparison.csv."""
+    metrics = ['hit_rate', 'hit_bad_rate', 'lift', 'pass_bad_rate',
+               'captured_bad_rate', 'false_reject_good_count']
+    def _get(sim, key):
+        if isinstance(sim, dict):
+            return float(sim.get(key, 0.0))
+        return float(sim[key].iloc[0]) if hasattr(sim, '__getitem__') else 0.0
+
+    rows = []
+    for m in metrics:
+        bv = _get(before_sim, m)
+        av = _get(after_sim, m)
+        delta = av - bv
+        rows.append({
+            'metric': m,
+            strategy_id_before: bv,
+            strategy_id_after: av,
+            'delta': delta,
+            'relative_change': safe_rate(delta, abs(bv) + EPSILON),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_confidence_evidence(evidence_id, object_type, object_id, metric_name,
+                               train_value, test_value, oot_value,
+                               threshold, pass_flag, confidence, reason, source_file):
+    """Build one confidence_evidence row; raises ValueError if any of train/test/oot value is None."""
+    for field, val in [('train_value', train_value), ('test_value', test_value), ('oot_value', oot_value)]:
+        if val is None:
+            raise ValueError(
+                'confidence_evidence: %s is required for traceability (evidence_id=%s). '
+                'Compute the metric on all three sample sets before building evidence.' % (field, evidence_id)
+            )
+    return {
+        'evidence_id': evidence_id,
+        'object_type': object_type,
+        'object_id': object_id,
+        'metric_name': metric_name,
+        'train_value': train_value,
+        'test_value': test_value,
+        'oot_value': oot_value,
+        'threshold': threshold,
+        'pass_flag': bool(pass_flag),
+        'confidence': confidence,
+        'reason': reason,
+        'source_file': source_file,
+    }
+```
 
 规则模拟必须至少覆盖 train/test/oot 总体、按月、按关键客群/产品/渠道分层。常见分层字段包括渠道、产品、地区、客群类型、新老客、额度区间；如数据没有这些字段，必须在 `strategy_summary.md` 中说明无法分层验证的限制。
 
@@ -938,11 +1311,14 @@ def build_monitoring_plan(rule_ids, rule_variables=None):
 2. 字段审计结论：字段可得性、泄露字段、不可稳定供应字段、剔除原因。
 3. 数据质量结论：可用变量数、剔除变量数、主要剔除原因。
 4. 变量有效性：TOP 变量、IV/KS/AUC、稳定性、单调性、泄露排查。
-5. 候选规则：规则条数、强拒绝/审核/观察数量、置信等级分布、规则重叠情况。
-6. 模拟结果：单规则和策略级拒绝率、通过率、命中坏样本占比、通过样本坏账率变化、按月和分层稳定性。
-7. 上线建议：建议上线、灰度、观察或废弃；必须引用 `rule_id` 和 `evidence_id`。
-8. 监控计划：上线后命中率、坏账率、通过坏账率、PSI、覆盖率、拒绝率的监控频率和预警阈值。
-9. 风险提示：样本偏差、变量含义不确定、跨期波动、客群/渠道差异、合规风险。
+5. 单变量候选规则：规则条数、通过 `filter_rule_candidates` 后留存数量、train/test/OOT lift 方向一致性；不稳定规则须注明不建议入策略原因。
+6. 多规则组合候选：TOP 组合规则、联合命中率/坏账率/lift；说明是否优于同覆盖的单规则。
+7. 决策树候选规则：规则条数、强拒绝/审核/观察数量、置信等级分布、规则重叠情况。
+8. 瀑布流评估：各步骤增量命中率/增量坏样本捕获率，train vs OOT 对比；说明边际收益递减点和建议截断步骤。
+9. 策略模拟：单规则和策略级拒绝率、通过率、命中坏样本占比、通过样本坏账率变化、按月和分层稳定性。
+10. 上线建议：建议上线、灰度、观察或废弃；必须引用 `rule_id` 和 `evidence_id`。
+11. 监控计划：上线后命中率、坏账率、通过坏账率、PSI、覆盖率、拒绝率的监控频率和预警阈值。
+12. 风险提示：样本偏差、变量含义不确定、跨期波动、客群/渠道差异、合规风险；若无分层字段须注明无法分层验证的限制。
 
 ## 最终交付清单
 
@@ -951,11 +1327,10 @@ def build_monitoring_plan(rule_ids, rule_variables=None):
 ```text
 run_config.json
 environment.json
-sample_profile.csv
+sample_profile.csv          # data_detect.csv 已统一替换为 sample_profile.csv
 sample_split_log.csv
 field_audit.csv
 leakage_audit.csv
-data_detect.csv
 data_quality.csv
 outlier_summary.csv
 feature_quality.csv
@@ -972,6 +1347,8 @@ decision_tree.dot
 decision_tree.png
 decision_tree_rules.csv
 single_rule_candidates.csv
+single_var_rule_eval.csv
+rule_combination_candidates.csv
 rule_overlap_matrix.csv
 strategy_rules.csv
 rule_simulation.csv
@@ -979,6 +1356,8 @@ strategy_level_simulation.csv
 monthly_rule_simulation.csv
 segment_rule_simulation.csv
 strategy_comparison.csv
+waterfall_simulation.csv
+waterfall_comparison.csv
 confidence_evidence.csv
 decision_log.csv
 monitoring_plan.csv
@@ -997,3 +1376,7 @@ strategy_summary.md
 - 不得在未完成字段泄露审计、OOT/按月验证、分层模拟和监控计划时给出上线建议。
 - 不得用 WOE 数值作为业务规则表达式；决策树规则必须能还原为分箱标签或业务区间。
 - 不得对 train/OOT 分别重新分箱后计算 PSI；必须复用训练集分箱规则。
+- 不得跳过单变量规则评估直接进入组合挖掘；单变量规则必须先经过 `evaluate_single_var_rules_cross_set` 跨集评估，不稳定的单变量规则不得进入组合候选。
+- 不得在 `confidence_evidence.csv` 中留空 `train_value`/`test_value`/`oot_value` 三列中的任意一列；三列均缺失的条目视为无效证据，不能支撑上线结论。
+- 不得仅输出瀑布流最终步骤结论而省略逐步增量数据；`waterfall_simulation.csv` 必须记录每一步 `incremental_hit`、`incremental_bad`、`incremental_captured_bad_rate`。
+- 不得在 test/OOT 上重新调用 `label_encode_bins`；必须使用训练集的 `mappings` 通过 `apply_label_encode` 统一编码，避免分箱整数码不一致导致规则阈值错位。
