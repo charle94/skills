@@ -60,7 +60,7 @@ PY
 | 5.1 单变量规则挖掘与评估 | 从分箱切点提取单变量候选规则，跨集评估稳定性 | `bin_detail` + `build_bin_masks` | `single_rule_candidates.csv`, `single_var_rule_eval.csv` | 每条规则命中率/坏样本数/lift 达标，train/test/OOT lift 方向一致 |
 | 5.2 多规则组合挖掘 | 枚举候选规则 OR 组合，筛选帕累托最优组合 | `itertools.combinations` + pandas mask | `rule_combination_candidates.csv` | 联合命中率/通过坏账率在业务约束范围内 |
 | 6. 策略制定与模拟 | 选择动作、阈值并评估业务影响 | 业务约束 + pandas mask | `strategy_rules.csv`, `strategy_comparison.csv`, `rule_simulation.csv`, `rule_simulation_full.csv`, `strategy_level_simulation.csv`, `monthly_rule_simulation.csv`, `segment_rule_simulation.csv` | train/test/OOT 表现一致或差异有解释，全量样本通过率与拒绝影响有评估 |
-| 6.1 瀑布流评估 | 按优先级顺序叠加规则，评估每步增量效果与跨期稳定性 | 累积 OR mask + `waterfall_cross_set` | `waterfall_simulation.csv`, `waterfall_comparison.csv` | 每步增量 lift/命中率与 train/OOT 方向一致，边际收益不为负 |
+| 6.1 瀑布流评估 | 按优先级顺序叠加规则，评估每步增量效果与跨期稳定性 | 累积 OR mask + `waterfall_cross_set` + `build_waterfall_simulation_full_population` | `waterfall_simulation.csv`, `waterfall_comparison.csv`, `waterfall_simulation_full.csv` | 每步增量 lift/命中率与 train/OOT 方向一致，全量样本累积拒绝率与通过坏率有评估 |
 | 7. 总结评审 | 可追溯结论 | 证据汇总 | `strategy_summary.md`, `confidence_evidence.csv` | 每条结论可追溯到数据和规则证据，train/test/oot 三列值均填写 |
 | 8. 上线监控 | 固化灰度与监控阈值 | 指标阈值表 | `monitoring_plan.csv` | 命中率、坏账率、PSI、覆盖率、拒绝率监控口径明确 |
 
@@ -1327,6 +1327,8 @@ def simulate_rules_by_segment(df, target, segment_cols, rule_masks):
 
 按业务优先级顺序顺序叠加规则，每步计算当前策略总体指标及该步新增的增量命中与增量坏样本。必须在 train/test/OOT 三个集合上分别执行并合并输出，便于对比跨期一致性。若某步 OOT 增量 lift 明显低于 train，需在 `decision_log.csv` 记录风险并在 `strategy_summary.md` 说明。
 
+与阶段 6 同样要求：可观测样本瀑布流（`build_waterfall_simulation` / `waterfall_cross_set` → `waterfall_simulation.csv`、`waterfall_comparison.csv`）必须配套输出**全量样本瀑布流** `build_waterfall_simulation_full_population` → `waterfall_simulation_full.csv`，对历史被拒客户用 `rejected_lift`（默认 1.5，或 `segment_lift_map`）做 reject inference，给出每一步累加后的真实拒绝率、全量通过坏率与增量贡献，避免离线评估与上线后真实通过率口径不一致。
+
 ```python
 def build_waterfall_simulation(df, ordered_rule_ids, rule_masks, target,
                                strategy_id_prefix='WF', segment='ALL'):
@@ -1378,6 +1380,45 @@ def waterfall_cross_set(df, ordered_rule_ids, rule_masks, target, sample_type_co
         wf = build_waterfall_simulation(sub_df, ordered_rule_ids, sub_masks, target, segment=seg)
         frames.append(wf)
     return pd.concat(frames, ignore_index=True)
+
+
+def build_waterfall_simulation_full_population(df_full, ordered_rule_ids, rule_masks, target,
+                                                rejected_lift=1.5, segment_lift_map=None,
+                                                segment_col=None,
+                                                strategy_id_prefix='WF_FULL', segment='ALL'):
+    """Full-population waterfall: cumulative OR-add with reject inference.
+
+    At each step k the cumulative mask covers rules 1..k; metrics come from
+    simulate_rule_full_population so observable rows contribute real bad
+    counts and rejected rows contribute overall_bad_rate * row_lift
+    (per-segment when segment_lift_map+segment_col supplied; else
+    rejected_lift, default 1.5). Incremental columns are computed on
+    full_hit_count / full_hit_bad_count_est so they stay consistent with
+    the full-population denominators.
+    """
+    rows = []
+    cumulative = pd.Series(False, index=df_full.index)
+    prev_hit = 0
+    prev_bad_est = 0.0
+    for step, rule_id in enumerate(ordered_rule_ids):
+        if rule_id not in rule_masks:
+            continue
+        cumulative = cumulative | rule_masks[rule_id]
+        strategy_id = '%s_S%02d_%s' % (strategy_id_prefix, step + 1, rule_id)
+        sim = simulate_rule_full_population(
+            df_full, cumulative, target,
+            rejected_lift=rejected_lift, segment_lift_map=segment_lift_map,
+            segment_col=segment_col, rule_id=strategy_id, segment=segment)
+        sim['waterfall_step'] = step + 1
+        sim['added_rule_id'] = rule_id
+        sim['cumulative_rule_ids'] = ','.join(ordered_rule_ids[:step + 1])
+        sim['incremental_full_hit'] = sim['full_hit_count'] - prev_hit
+        sim['incremental_full_bad_est'] = sim['full_hit_bad_count_est'] - prev_bad_est
+        sim['incremental_full_hit_rate'] = safe_rate(sim['incremental_full_hit'], sim['full_sample_count'])
+        rows.append(sim)
+        prev_hit = sim['full_hit_count']
+        prev_bad_est = sim['full_hit_bad_count_est']
+    return pd.DataFrame(rows)
 ```
 
 ## 阶段 7：总结评审与可追溯证据
@@ -1534,6 +1575,7 @@ monthly_rule_simulation.csv
 segment_rule_simulation.csv
 strategy_comparison.csv
 waterfall_simulation.csv
+waterfall_simulation_full.csv
 waterfall_comparison.csv
 confidence_evidence.csv
 decision_log.csv
@@ -1555,7 +1597,7 @@ strategy_summary.md
 - 不得对 train/OOT 分别重新分箱后计算 PSI；必须复用训练集分箱规则。
 - 不得跳过单变量规则评估直接进入组合挖掘；单变量规则必须先经过 `evaluate_single_var_rules_cross_set` 跨集评估，不稳定的单变量规则不得进入组合候选。
 - 不得在 `confidence_evidence.csv` 中留空 `train_value`/`test_value`/`oot_value` 三列中的任意一列；三列均缺失的条目视为无效证据，不能支撑上线结论。
-- 不得仅输出瀑布流最终步骤结论而省略逐步增量数据；`waterfall_simulation.csv` 必须记录每一步 `incremental_hit`、`incremental_bad`、`incremental_captured_bad_rate`。
+- 不得仅输出瀑布流最终步骤结论而省略逐步增量数据；`waterfall_simulation.csv` 必须记录每一步 `incremental_hit`、`incremental_bad`、`incremental_captured_bad_rate`，且必须同时输出 `waterfall_simulation_full.csv`（含 reject inference 的全量累积拒绝率与增量）。
 - 不得在 test/OOT 上重新调用 `label_encode_bins`；必须使用训练集的 `mappings` 通过 `apply_label_encode` 统一编码，避免分箱整数码不一致导致规则阈值错位。
 - 不得把 `target` 为空的样本（历史被拒/无表现）混入变量评估、WOE/IV、KS/AUC、PSI、决策树挖掘；必须先用 `split_observable_sample` 隔离。
 - 不得只输出可观测样本的 `rule_simulation.csv` 而省略 `rule_simulation_full.csv`；全量样本通过率与被拒客户 reject inference（未提示字段/分层时默认 `lift=1.5`）必须落表。
