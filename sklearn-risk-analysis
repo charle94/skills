@@ -59,8 +59,8 @@ PY
 | 5. 决策树规则挖掘 | 使用决策树生成候选多变量组合规则 | `DecisionTreeClassifier`, `graphviz` | `decision_tree_rules.csv`, `decision_tree.png`, `rule_overlap_matrix.csv` | 节点正负样本、触碰率、坏比例、lift、规则路径清晰 |
 | 5.1 单变量规则挖掘与评估 | 从分箱切点提取单变量候选规则，跨集评估稳定性 | `bin_detail` + `build_bin_masks` | `single_rule_candidates.csv`, `single_var_rule_eval.csv` | 每条规则命中率/坏样本数/lift 达标，train/test/OOT lift 方向一致 |
 | 5.2 多规则组合挖掘 | 枚举候选规则 OR 组合，筛选帕累托最优组合 | `itertools.combinations` + pandas mask | `rule_combination_candidates.csv` | 联合命中率/通过坏账率在业务约束范围内 |
-| 6. 策略制定与模拟 | 选择动作、阈值并评估业务影响 | 业务约束 + pandas mask | `strategy_rules.csv`, `strategy_comparison.csv`, `rule_simulation.csv`, `strategy_level_simulation.csv`, `monthly_rule_simulation.csv`, `segment_rule_simulation.csv` | train/test/OOT 表现一致或差异有解释 |
-| 6.1 瀑布流评估 | 按优先级顺序叠加规则，评估每步增量效果与跨期稳定性 | 累积 OR mask + `waterfall_cross_set` | `waterfall_simulation.csv`, `waterfall_comparison.csv` | 每步增量 lift/命中率与 train/OOT 方向一致，边际收益不为负 |
+| 6. 策略制定与模拟 | 选择动作、阈值并评估业务影响 | 业务约束 + pandas mask | `strategy_rules.csv`, `strategy_comparison.csv`, `rule_simulation.csv`, `rule_simulation_full.csv`, `strategy_level_simulation.csv`, `monthly_rule_simulation.csv`, `segment_rule_simulation.csv` | train/test/OOT 表现一致或差异有解释，全量样本通过率与拒绝影响有评估 |
+| 6.1 瀑布流评估 | 按优先级顺序叠加规则，评估每步增量效果与跨期稳定性 | 累积 OR mask + `waterfall_cross_set` + `build_waterfall_simulation_full_population` | `waterfall_simulation.csv`, `waterfall_comparison.csv`, `waterfall_simulation_full.csv` | 每步增量 lift/命中率与 train/OOT 方向一致，全量样本累积拒绝率与通过坏率有评估 |
 | 7. 总结评审 | 可追溯结论 | 证据汇总 | `strategy_summary.md`, `confidence_evidence.csv` | 每条结论可追溯到数据和规则证据，train/test/oot 三列值均填写 |
 | 8. 上线监控 | 固化灰度与监控阈值 | 指标阈值表 | `monitoring_plan.csv` | 命中率、坏账率、PSI、覆盖率、拒绝率监控口径明确 |
 
@@ -146,13 +146,32 @@ def log_decision(log_path, stage, object_id, decision, reason, input_files='', o
 
 ## 阶段 0：样本口径
 
-所有后续分析必须优先通过 `sample_type` 引用样本集：分箱规则、WOE/IV、变量质量和规则树以 `train` 为基准，PSI 对比 `train/test/oot`，策略模拟分别输出各样本集表现。若输入缺少 `sample_type`，只能用 `get_sample` 明确降级为全量 train，并在 `decision_log.csv` 记录风险。
+样本必须明确区分：
+
+- **可观测样本**（`target` 非空）：变量评估、WOE/IV、KS/AUC、PSI、决策树挖掘、单/组合规则评估全部基于这部分样本。
+- **不可观测样本**（`target` 为空，例如历史被拒客户）：不进入变量建模与规则挖掘，但**必须进入阶段 6 全量规则模拟**（见 `simulate_rule_full_population`），用于估算真实通过率与拒绝影响。
+
+所有后续分析必须优先通过 `sample_type` 引用样本集：分箱规则、WOE/IV、变量质量和规则树以 `train` 为基准，PSI 对比 `train/test/oot`，策略模拟分别输出各样本集表现。`sample_type` 仅在可观测样本上分配 `train/test/oot`。若输入缺少 `sample_type`，只能用 `get_sample` 明确降级为全量 train，并在 `decision_log.csv` 记录风险。
 
 ```python
+def split_observable_sample(df, target):
+    """Split df into (observable, rejected) by whether target is null.
+
+    Variable evaluation, WOE/IV, KS/AUC, PSI and decision-tree mining run on
+    the observable frame. Rule simulation must additionally feed the full
+    frame (observable + rejected) into simulate_rule_full_population so that
+    pass-through and reject-inference effects are captured.
+    """
+    observable = df[df[target].notna()].copy()
+    rejected = df[df[target].isna()].copy()
+    return observable, rejected
+
+
 def validate_binary_target(df, target):
+    """Validate that observable target is binary 0/1. Null rows are treated as rejected/unobservable and skipped here."""
     values = sorted(pd.Series(df[target]).dropna().unique().tolist())
     if values != [0, 1]:
-        raise ValueError('target must be binary 0/1, got: %s' % values)
+        raise ValueError('target must be binary 0/1 on observable rows, got: %s' % values)
 
 
 def sample_profile(df, target, time_col=None, sample_type_col='sample_type'):
@@ -167,6 +186,12 @@ def sample_profile(df, target, time_col=None, sample_type_col='sample_type'):
 
 
 def split_samples(df, target, time_col=None, oot_months=3, test_ratio=0.2, oot_ratio=0.1, random_state=42, sample_type_col='sample_type'):
+    """Split observable rows into train/test/oot. Call only on the observable
+    frame (target not null); rejected rows are not modeled and have no
+    sample_type. Caller is responsible for filtering with split_observable_sample first.
+    """
+    if df[target].isna().any():
+        raise ValueError('split_samples requires non-null target; call split_observable_sample first.')
     result = df.copy()
     log_rows = []
     if time_col and time_col in result.columns:
@@ -605,12 +630,20 @@ def ks_score(score, target):
 
 
 def feature_quality_from_woe(woe_df, target_s, iv_summary):
+    """Compute IV / KS / AUC per feature.
+
+    WOE convention here is "higher WOE -> lower risk", so roc_auc_score(y, woe)
+    measures the probability that a good sample ranks above a bad sample. We
+    fold the score with max(auc, 1-auc) so the reported AUC is always >= 0.5
+    and reflects discriminative power regardless of sign convention.
+    """
     rows = []
     iv_map = dict(zip(iv_summary['feature'], iv_summary['iv']))
     for col in woe_df.columns:
         score = woe_df[col].fillna(0.0)
         try:
-            auc = roc_auc_score(target_s, score)
+            raw_auc = float(roc_auc_score(target_s, score))
+            auc = max(raw_auc, 1.0 - raw_auc)
         except Exception:
             auc = np.nan
         rows.append({'feature': col, 'iv': iv_map.get(col, 0.0), 'ks': ks_score(score, target_s), 'auc': auc})
@@ -666,7 +699,7 @@ def build_feature_drop_reason(quality_df=None, leakage_df=None, corr_df=None, ps
 
 ## 阶段 5：决策树规则挖掘与 Graphviz 图片
 
-决策树输入必须优先使用分箱后的整数编码，而不是 WOE 值，保证树规则能还原为业务区间。数值分箱编码必须沿用有序分箱顺序；无序分类变量使用标签编码时，树分裂中的 `<=` 只表示编码集合切分，不代表类别有自然大小关系。规则解释必须通过 `decode_condition` 还原为类别集合，并提示该限制；高基数分类应先降维为 Top N + `OTHER`，如追求更高规则质量，可另行对比 OneHot 编码候选规则。每个叶子节点输出一条候选单规则，必须包含正负样本数、坏比例、触碰率、lift、编码规则和 `rule_readable` 业务可读规则。
+决策树输入必须优先使用分箱后的整数编码，而不是 WOE 值，保证树规则能还原为业务区间。`render_tree_graphviz` 节点必须按 `bad_rate/overall_bad_rate` 上色（绿 → 红，叶子加粗），且 label 中的 `\n` 必须以单反斜杠形式写入 `.dot`（不要再做反斜杠转义），否则 Graphviz 不会换行。数值分箱编码必须沿用有序分箱顺序；无序分类变量使用标签编码时，树分裂中的 `<=` 只表示编码集合切分，不代表类别有自然大小关系。规则解释必须通过 `decode_condition` 还原为类别集合，并提示该限制；高基数分类应先降维为 Top N + `OTHER`，如追求更高规则质量，可另行对比 OneHot 编码候选规则。每个叶子节点输出一条候选单规则，必须包含正负样本数、坏比例、触碰率、lift、编码规则和 `rule_readable` 业务可读规则。
 
 ```python
 def label_encode_bins(binned, categorical_cols=None):
@@ -730,15 +763,24 @@ def fit_rule_tree(train_x, train_y, max_depth=3, min_samples_leaf=0.03, min_samp
 def tree_node_metrics(tree, node_id, total_count, overall_bad_rate):
     """Compute per-node metrics from a fitted DecisionTreeClassifier.
 
-    sklearn stores raw sample counts (not probabilities) in tree_.value when
-    sample_weight is not used.  We read them directly without the
-    value_sum == 1.0 heuristic which breaks for sample_count == 1 or when
-    sample_weight is provided.
+    sklearn>=1.3 stores tree_.value as normalized class probabilities
+    (rows sum to 1); older versions store raw (possibly weighted) class
+    counts. We auto-detect via row sum and recover counts using
+    weighted_n_node_samples so that good_count + bad_count == sample_count
+    (rounded) in both regimes.
     """
     sample = int(tree.tree_.n_node_samples[node_id])
-    class_values = tree.tree_.value[node_id][0]
-    good = int(round(class_values[0]))
-    bad = int(round(class_values[1])) if len(class_values) > 1 else 0
+    weighted_n = float(tree.tree_.weighted_n_node_samples[node_id])
+    raw = tree.tree_.value[node_id][0]
+    raw_sum = float(np.sum(raw))
+    if abs(raw_sum - 1.0) < 1e-6:
+        # Probability mode: multiply by weighted samples to recover counts.
+        good = int(round(float(raw[0]) * weighted_n))
+        bad = int(round(float(raw[1]) * weighted_n)) if len(raw) > 1 else 0
+    else:
+        # Count mode (older sklearn or sample_weight provided as counts).
+        good = int(round(float(raw[0])))
+        bad = int(round(float(raw[1]))) if len(raw) > 1 else 0
     bad_rate = safe_rate(bad, good + bad)
     hit_rate = safe_rate(sample, total_count)
     return {'sample_count': sample, 'good_count': good, 'bad_count': bad, 'hit_rate': hit_rate, 'bad_rate': bad_rate, 'lift': safe_rate(bad_rate, overall_bad_rate)}
@@ -834,6 +876,13 @@ def rule_overlap_matrix(rule_masks):
 
 
 def render_tree_graphviz(tree, feature_names, train_y, output_prefix):
+    """Render tree to .dot/.png with newline-correct labels and bad_rate coloring.
+
+    Label uses DOT's '\\n' line-break (single backslash + n in the file), so we
+    must NOT escape backslashes; only '"' is escaped. Each node is filled by
+    bad_rate / overall_bad_rate: green (safe) -> red (risky); leaf nodes are
+    drawn with a bold border for emphasis.
+    """
     total_count = len(train_y)
     overall_bad_rate = float(pd.Series(train_y).mean())
     try:
@@ -841,26 +890,45 @@ def render_tree_graphviz(tree, feature_names, train_y, output_prefix):
     except Exception as exc:
         graphviz = None
         print('graphviz import failed:', exc)
-    lines = ['digraph Tree {', 'node [shape=box, fontname="Microsoft YaHei"];']
+    lines = [
+        'digraph Tree {',
+        'node [shape=box, style="filled,rounded", fontname="Microsoft YaHei"];',
+        'edge [fontname="Microsoft YaHei"];',
+    ]
 
-    def dot_escape(value):
-        return str(value).replace('\\', '\\\\').replace('"', '\\"')
+    def dot_escape_label(value):
+        # Only escape '"'; keep '\\n' as DOT line break.
+        return str(value).replace('"', '\\"')
 
-    def label(node_id):
-        m = tree_node_metrics(tree, node_id, total_count, overall_bad_rate)
-        return 'node=%s\\nsample=%s\\ngood=%s bad=%s\\nhit=%.2f%%\\nbad_rate=%.2f%%\\nlift=%.3f' % (
-            node_id, m['sample_count'], m['good_count'], m['bad_count'], m['hit_rate'] * 100, m['bad_rate'] * 100, m['lift'])
+    def node_fillcolor(bad_rate):
+        # Map bad_rate/overall to hue: 0 (green) when lift<=0, 1 (red) when lift>=2.
+        ratio = 0.5 if overall_bad_rate <= 0 else min(bad_rate / (overall_bad_rate * 2.0), 1.0)
+        ratio = max(0.0, ratio)
+        hue = (1.0 - ratio) * 0.33  # 0.33 green -> 0.0 red
+        return '%.3f %.3f %.3f' % (hue, 0.35, 1.0)
+
+    def label(node_id, m):
+        # Use raw-style backslash-n so the .dot file contains literal '\\n'.
+        return (r'node=%d\nsample=%d\ngood=%d bad=%d\n'
+                r'hit=%.2f%% bad_rate=%.2f%% lift=%.3f') % (
+            node_id, m['sample_count'], m['good_count'], m['bad_count'],
+            m['hit_rate'] * 100, m['bad_rate'] * 100, m['lift'])
 
     def walk(node_id):
-        lines.append('%s [label="%s"];' % (node_id, dot_escape(label(node_id))))
+        m = tree_node_metrics(tree, node_id, total_count, overall_bad_rate)
         left_id = tree.tree_.children_left[node_id]
         right_id = tree.tree_.children_right[node_id]
-        if left_id == _tree.TREE_LEAF and right_id == _tree.TREE_LEAF:
+        is_leaf = left_id == _tree.TREE_LEAF and right_id == _tree.TREE_LEAF
+        attrs = 'label="%s", fillcolor="%s"' % (dot_escape_label(label(node_id, m)), node_fillcolor(m['bad_rate']))
+        if is_leaf:
+            attrs += ', penwidth=2'
+        lines.append('%d [%s];' % (node_id, attrs))
+        if is_leaf:
             return
         feature = feature_names[tree.tree_.feature[node_id]]
         threshold = tree.tree_.threshold[node_id]
-        lines.append('%s -> %s [label="%s <= %.6f"];' % (node_id, left_id, dot_escape(feature), threshold))
-        lines.append('%s -> %s [label="%s > %.6f"];' % (node_id, right_id, dot_escape(feature), threshold))
+        lines.append('%d -> %d [label="%s <= %.6f"];' % (node_id, left_id, dot_escape_label(feature), threshold))
+        lines.append('%d -> %d [label="%s > %.6f"];' % (node_id, right_id, dot_escape_label(feature), threshold))
         walk(left_id)
         walk(right_id)
 
@@ -1008,6 +1076,13 @@ def mine_rule_combinations(df, candidate_rule_ids, rule_masks, target,
 
 ## 阶段 6：规则模拟
 
+规则模拟必须同时覆盖**可观测样本**与**全量样本（含历史被拒）**两套口径：
+
+- `simulate_rule` / `simulate_combined_rules`：基于可观测样本，输出真实命中坏率、lift、捕获坏样本率，用于评估规则区分力。
+- `simulate_rule_full_population`：基于全量样本（observable + rejected），用 reject inference 估算被拒客户的坏率。优先按用户提供的 `segment_lift_map`（如不同来源/客群的历史 lift）映射；未提示可用字段或分层时，统一对历史被拒客户使用默认 `rejected_lift=1.5`，用于评估规则对真实通过率与全量坏率的影响。
+
+两套模拟结果分别落到 `rule_simulation.csv` 与 `rule_simulation_full.csv`，禁止只输出其一。
+
 ```python
 def build_rule_masks(df, rules):
     """Build boolean masks for decision-tree rules using df.eval.
@@ -1058,6 +1133,107 @@ def simulate_rule(df, mask, target, rule_id='', segment='ALL'):
         'captured_bad_rate': safe_rate(hit_bad, total_bad),
         'false_reject_good_count': hit_count - hit_bad,
     }
+
+
+def simulate_rule_full_population(df_full, mask_full, target,
+                                   rejected_lift=1.5, segment_lift_map=None,
+                                   segment_col=None, rule_id='', segment='ALL'):
+    """Simulate a rule on the FULL population (observable + rejected/no bad_flag).
+
+    Observable rows (target not null) contribute actual bad counts.
+    Rejected rows (target null) contribute an inferred bad count:
+      expected_bad_per_row = observable_overall_bad_rate * row_lift
+    where row_lift comes from segment_lift_map[df[segment_col]] when both are
+    provided, otherwise falls back to `rejected_lift` (default 1.5 per spec).
+
+    Returns the same shape as simulate_rule plus observable_*, rejected_*,
+    full_*, and reject_inference_method fields.
+    """
+    obs_mask_all = df_full[target].notna()
+    rej_mask_all = ~obs_mask_all
+    overall_bad_rate = float(df_full.loc[obs_mask_all, target].mean()) if obs_mask_all.any() else 0.0
+
+    # Observable side: real counts.
+    obs_hit = mask_full & obs_mask_all
+    obs_pass = (~mask_full) & obs_mask_all
+    obs_hit_count = int(obs_hit.sum())
+    obs_pass_count = int(obs_pass.sum())
+    obs_hit_bad = int(df_full.loc[obs_hit, target].sum()) if obs_hit_count else 0
+    obs_pass_bad = int(df_full.loc[obs_pass, target].sum()) if obs_pass_count else 0
+
+    # Rejected side: inferred via lift.
+    rej_hit = mask_full & rej_mask_all
+    rej_pass = (~mask_full) & rej_mask_all
+    rej_hit_count = int(rej_hit.sum())
+    rej_pass_count = int(rej_pass.sum())
+    if segment_col and segment_lift_map and segment_col in df_full.columns:
+        lift_map = {str(k): float(v) for k, v in segment_lift_map.items()}
+        row_lift = df_full[segment_col].astype(str).map(lift_map).fillna(rejected_lift)
+        per_row_bad = overall_bad_rate * row_lift
+        rej_hit_bad_est = float(per_row_bad.loc[rej_hit].sum())
+        rej_pass_bad_est = float(per_row_bad.loc[rej_pass].sum())
+        method = 'segment_lift(default=%.2f)' % rejected_lift
+    else:
+        rej_hit_bad_est = rej_hit_count * overall_bad_rate * rejected_lift
+        rej_pass_bad_est = rej_pass_count * overall_bad_rate * rejected_lift
+        method = 'default_lift_%.2f' % rejected_lift
+
+    full_count = len(df_full)
+    full_hit_count = obs_hit_count + rej_hit_count
+    full_pass_count = obs_pass_count + rej_pass_count
+    full_hit_bad_est = obs_hit_bad + rej_hit_bad_est
+    full_pass_bad_est = obs_pass_bad + rej_pass_bad_est
+    full_bad_est = full_hit_bad_est + full_pass_bad_est
+    full_overall_bad_rate_est = safe_rate(full_bad_est, full_count)
+    full_hit_bad_rate_est = safe_rate(full_hit_bad_est, full_hit_count)
+    return {
+        'segment': segment,
+        'rule_id': rule_id,
+        'reject_inference_method': method,
+        # observable (actual)
+        'observable_sample_count': int(obs_mask_all.sum()),
+        'observable_overall_bad_rate': overall_bad_rate,
+        'observable_hit_count': obs_hit_count,
+        'observable_hit_bad_count': obs_hit_bad,
+        'observable_hit_bad_rate': safe_rate(obs_hit_bad, obs_hit_count),
+        'observable_pass_bad_rate': safe_rate(obs_pass_bad, obs_pass_count),
+        # rejected (inferred)
+        'rejected_sample_count': int(rej_mask_all.sum()),
+        'rejected_hit_count': rej_hit_count,
+        'rejected_hit_bad_count_est': rej_hit_bad_est,
+        'rejected_pass_bad_count_est': rej_pass_bad_est,
+        # full population
+        'full_sample_count': full_count,
+        'full_hit_count': full_hit_count,
+        'full_hit_rate': safe_rate(full_hit_count, full_count),
+        'full_pass_count': full_pass_count,
+        'full_pass_rate': safe_rate(full_pass_count, full_count),
+        'full_hit_bad_count_est': full_hit_bad_est,
+        'full_pass_bad_count_est': full_pass_bad_est,
+        'full_hit_bad_rate_est': full_hit_bad_rate_est,
+        'full_pass_bad_rate_est': safe_rate(full_pass_bad_est, full_pass_count),
+        'full_overall_bad_rate_est': full_overall_bad_rate_est,
+        'full_lift_est': safe_rate(full_hit_bad_rate_est, full_overall_bad_rate_est),
+    }
+
+
+def simulate_rules_full_population_by_month(df_full, target, time_col, rule_masks,
+                                             rejected_lift=1.5, segment_lift_map=None,
+                                             segment_col=None):
+    """Full-population variant of simulate_rules_by_month. Output: rule_simulation_full.csv."""
+    rows = []
+    for rule_id, mask in rule_masks.items():
+        rows.append(simulate_rule_full_population(
+            df_full, mask, target, rejected_lift=rejected_lift,
+            segment_lift_map=segment_lift_map, segment_col=segment_col,
+            rule_id=rule_id, segment='ALL'))
+        if time_col and time_col in df_full.columns:
+            for period, group in df_full.groupby(time_col):
+                rows.append(simulate_rule_full_population(
+                    group, mask.loc[group.index], target,
+                    rejected_lift=rejected_lift, segment_lift_map=segment_lift_map,
+                    segment_col=segment_col, rule_id=rule_id, segment=str(period)))
+    return pd.DataFrame(rows)
 
 
 def simulate_combined_rules(df, rule_masks, target, selected_rule_ids=None, strategy_id='S001', segment='ALL'):
@@ -1151,6 +1327,8 @@ def simulate_rules_by_segment(df, target, segment_cols, rule_masks):
 
 按业务优先级顺序顺序叠加规则，每步计算当前策略总体指标及该步新增的增量命中与增量坏样本。必须在 train/test/OOT 三个集合上分别执行并合并输出，便于对比跨期一致性。若某步 OOT 增量 lift 明显低于 train，需在 `decision_log.csv` 记录风险并在 `strategy_summary.md` 说明。
 
+与阶段 6 同样要求：可观测样本瀑布流（`build_waterfall_simulation` / `waterfall_cross_set` → `waterfall_simulation.csv`、`waterfall_comparison.csv`）必须配套输出**全量样本瀑布流** `build_waterfall_simulation_full_population` → `waterfall_simulation_full.csv`，对历史被拒客户用 `rejected_lift`（默认 1.5，或 `segment_lift_map`）做 reject inference，给出每一步累加后的真实拒绝率、全量通过坏率与增量贡献，避免离线评估与上线后真实通过率口径不一致。
+
 ```python
 def build_waterfall_simulation(df, ordered_rule_ids, rule_masks, target,
                                strategy_id_prefix='WF', segment='ALL'):
@@ -1202,6 +1380,45 @@ def waterfall_cross_set(df, ordered_rule_ids, rule_masks, target, sample_type_co
         wf = build_waterfall_simulation(sub_df, ordered_rule_ids, sub_masks, target, segment=seg)
         frames.append(wf)
     return pd.concat(frames, ignore_index=True)
+
+
+def build_waterfall_simulation_full_population(df_full, ordered_rule_ids, rule_masks, target,
+                                                rejected_lift=1.5, segment_lift_map=None,
+                                                segment_col=None,
+                                                strategy_id_prefix='WF_FULL', segment='ALL'):
+    """Full-population waterfall: cumulative OR-add with reject inference.
+
+    At each step k the cumulative mask covers rules 1..k; metrics come from
+    simulate_rule_full_population so observable rows contribute real bad
+    counts and rejected rows contribute overall_bad_rate * row_lift
+    (per-segment when segment_lift_map+segment_col supplied; else
+    rejected_lift, default 1.5). Incremental columns are computed on
+    full_hit_count / full_hit_bad_count_est so they stay consistent with
+    the full-population denominators.
+    """
+    rows = []
+    cumulative = pd.Series(False, index=df_full.index)
+    prev_hit = 0
+    prev_bad_est = 0.0
+    for step, rule_id in enumerate(ordered_rule_ids):
+        if rule_id not in rule_masks:
+            continue
+        cumulative = cumulative | rule_masks[rule_id]
+        strategy_id = '%s_S%02d_%s' % (strategy_id_prefix, step + 1, rule_id)
+        sim = simulate_rule_full_population(
+            df_full, cumulative, target,
+            rejected_lift=rejected_lift, segment_lift_map=segment_lift_map,
+            segment_col=segment_col, rule_id=strategy_id, segment=segment)
+        sim['waterfall_step'] = step + 1
+        sim['added_rule_id'] = rule_id
+        sim['cumulative_rule_ids'] = ','.join(ordered_rule_ids[:step + 1])
+        sim['incremental_full_hit'] = sim['full_hit_count'] - prev_hit
+        sim['incremental_full_bad_est'] = sim['full_hit_bad_count_est'] - prev_bad_est
+        sim['incremental_full_hit_rate'] = safe_rate(sim['incremental_full_hit'], sim['full_sample_count'])
+        rows.append(sim)
+        prev_hit = sim['full_hit_count']
+        prev_bad_est = sim['full_hit_bad_count_est']
+    return pd.DataFrame(rows)
 ```
 
 ## 阶段 7：总结评审与可追溯证据
@@ -1352,11 +1569,13 @@ rule_combination_candidates.csv
 rule_overlap_matrix.csv
 strategy_rules.csv
 rule_simulation.csv
+rule_simulation_full.csv
 strategy_level_simulation.csv
 monthly_rule_simulation.csv
 segment_rule_simulation.csv
 strategy_comparison.csv
 waterfall_simulation.csv
+waterfall_simulation_full.csv
 waterfall_comparison.csv
 confidence_evidence.csv
 decision_log.csv
@@ -1378,5 +1597,8 @@ strategy_summary.md
 - 不得对 train/OOT 分别重新分箱后计算 PSI；必须复用训练集分箱规则。
 - 不得跳过单变量规则评估直接进入组合挖掘；单变量规则必须先经过 `evaluate_single_var_rules_cross_set` 跨集评估，不稳定的单变量规则不得进入组合候选。
 - 不得在 `confidence_evidence.csv` 中留空 `train_value`/`test_value`/`oot_value` 三列中的任意一列；三列均缺失的条目视为无效证据，不能支撑上线结论。
-- 不得仅输出瀑布流最终步骤结论而省略逐步增量数据；`waterfall_simulation.csv` 必须记录每一步 `incremental_hit`、`incremental_bad`、`incremental_captured_bad_rate`。
+- 不得仅输出瀑布流最终步骤结论而省略逐步增量数据；`waterfall_simulation.csv` 必须记录每一步 `incremental_hit`、`incremental_bad`、`incremental_captured_bad_rate`，且必须同时输出 `waterfall_simulation_full.csv`（含 reject inference 的全量累积拒绝率与增量）。
 - 不得在 test/OOT 上重新调用 `label_encode_bins`；必须使用训练集的 `mappings` 通过 `apply_label_encode` 统一编码，避免分箱整数码不一致导致规则阈值错位。
+- 不得把 `target` 为空的样本（历史被拒/无表现）混入变量评估、WOE/IV、KS/AUC、PSI、决策树挖掘；必须先用 `split_observable_sample` 隔离。
+- 不得只输出可观测样本的 `rule_simulation.csv` 而省略 `rule_simulation_full.csv`；全量样本通过率与被拒客户 reject inference（未提示字段/分层时默认 `lift=1.5`）必须落表。
+- 不得使用 `dot_escape` 等会把 `\n` 二次转义的写法生成决策树 `.dot`；节点 label 中的 `\n` 必须以单反斜杠形式写入文件，且节点要按 `bad_rate/overall_bad_rate` 着色。
