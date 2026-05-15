@@ -1,0 +1,31 @@
+{
+  "name": "@charle94/pi-credit-risk",
+  "version": "0.1.0",
+  "description": "Pi-agent package for sklearn/pandas credit-risk third-party data evaluation, WOE/IV/PSI, decision-tree rule mining, and rule simulation with reproducible deterministic Python pipeline, prompt templates, and a workflow extension that enforces stage-by-stage artifact completeness.",
+  "keywords": [
+    "pi-package",
+    "credit-risk",
+    "risk-control",
+    "scorecard",
+    "woe",
+    "psi",
+    "rule-mining",
+    "scikit-learn"
+  ],
+  "license": "MIT",
+  "private": false,
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test:python": "python3 -m pytest tests/ -q"
+  }
+}

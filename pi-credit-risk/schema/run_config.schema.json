@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "pi-credit-risk run_config",
+  "description": "Configuration for a single risk-analysis run. Pipeline reads this from runs/<run_id>/run_config.json (a frozen copy of the user-supplied config).",
+  "type": "object",
+  "required": [
+    "run_id",
+    "input_csv",
+    "target",
+    "output_dir"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Unique identifier; used as the runs/<run_id>/ directory name."
+    },
+    "input_csv": {
+      "type": "string",
+      "description": "Path to the input feature/sample CSV. Must be readable; never written to."
+    },
+    "field_meta_csv": {
+      "type": ["string", "null"],
+      "description": "Optional field-dictionary CSV: feature,source,meaning,available_time,pre_decision_available,post_loan_field,decision_time."
+    },
+    "target": {
+      "type": "string",
+      "description": "Binary target column. Rows where target IS NULL are treated as historical rejections (no observable outcome) and used only in full-population rule simulation."
+    },
+    "id_col": {
+      "type": ["string", "null"],
+      "description": "Unique customer / application id column. Excluded from modelling; used only for de-duplication and traceability."
+    },
+    "time_col": {
+      "type": ["string", "null"],
+      "description": "Time column (apply month / observation month). Drives time-based train/test/OOT split and monthly simulation."
+    },
+    "exclude_cols": {
+      "type": "array",
+      "items": {"type": "string"},
+      "default": [],
+      "description": "Columns to exclude from modelling (target, id, time, post-loan, manual-approval, leakage)."
+    },
+    "feature_cols": {
+      "type": ["array", "null"],
+      "items": {"type": "string"},
+      "description": "Explicit feature whitelist. If null, all columns except target/id/time/exclude are used."
+    },
+    "special_values": {
+      "type": "object",
+      "additionalProperties": {"type": "array"},
+      "default": {},
+      "description": "Per-feature special values that should bin into the SPECIAL bucket (e.g. -99, -999 for 'no data')."
+    },
+    "test_ratio": {"type": "number", "minimum": 0.0, "maximum": 0.9, "default": 0.2},
+    "oot_ratio": {"type": "number", "minimum": 0.0, "maximum": 0.9, "default": 0.1},
+    "oot_months": {"type": "integer", "minimum": 1, "default": 3},
+    "random_state": {"type": "integer", "default": 42},
+    "bins": {"type": "integer", "minimum": 2, "default": 10},
+    "max_levels": {"type": "integer", "minimum": 2, "default": 20},
+    "psi_stable_threshold": {"type": "number", "minimum": 0.0, "default": 0.1},
+    "psi_watch_threshold": {"type": "number", "minimum": 0.0, "default": 0.25},
+    "tree_max_depth": {"type": "integer", "minimum": 1, "default": 3},
+    "tree_min_samples_leaf": {"type": "number", "minimum": 0.0, "default": 0.03},
+    "tree_min_samples_split": {"type": "number", "minimum": 0.0, "default": 0.06},
+    "rule_min_hit_rate": {"type": "number", "minimum": 0.0, "default": 0.01},
+    "rule_min_bad_count": {"type": "integer", "minimum": 1, "default": 10},
+    "rule_min_lift": {"type": "number", "minimum": 0.0, "default": 1.5},
+    "combo_max_size": {"type": "integer", "minimum": 2, "default": 2},
+    "combo_top_n": {"type": "integer", "minimum": 2, "default": 20},
+    "rejected_lift": {"type": "number", "minimum": 0.0, "default": 1.5,
+      "description": "Lift assigned to historical-rejection rows for reject inference."},
+    "segment_col": {"type": ["string", "null"], "default": null},
+    "segment_lift_map": {"type": ["object", "null"], "default": null,
+      "additionalProperties": {"type": "number"}},
+    "max_reject_rate": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.2},
+    "max_pass_bad_rate": {"type": ["number", "null"], "default": null},
+    "output_dir": {
+      "type": "string",
+      "description": "Run output directory. All artifacts live here. Will be created if missing."
+    }
+  }
+}

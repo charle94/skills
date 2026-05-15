@@ -1,0 +1,10 @@
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.1
+# Optional: graphviz Python binding + system `dot` for decision-tree PNGs.
+# Pipeline falls back to .dot-only output when unavailable.
+graphviz==0.20.3
+# Test-only
+pytest==8.3.2
+jsonschema==4.23.0
