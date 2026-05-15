@@ -1,67 +1,47 @@
 ---
-name: cr-init
-description: Initialize a credit-risk analysis run. Creates runs/<run_id>/, generates run_config.json from arguments, validates inputs, and writes the initial manifest.json with status=INPUT_VALIDATED.
-arguments:
-  - name: run_id
-    description: Unique identifier (alnum / _-., 1..64 chars).
-    required: true
-  - name: input_csv
-    description: Path to the sample CSV. Will be read-only.
-    required: true
-  - name: target
-    description: Binary target column. Rows with NULL target are treated as historical rejections.
-    required: true
-  - name: field_meta_csv
-    description: Optional path to field metadata CSV.
-    required: false
-  - name: id_col
-    description: Optional unique-id column.
-    required: false
-  - name: time_col
-    description: Optional time / month column for time-based OOT.
-    required: false
+description: Initialize a credit-risk analysis run (writes runs/<run_id>/run_config.json + manifest.json)
+argument-hint: "<run_id> <input_csv> <target> [field_meta_csv] [id_col] [time_col]"
 ---
 
-# /cr-init — initialize a credit-risk run
+You are the pi-credit-risk orchestration agent. The user has invoked `/cr-init` with these positional arguments:
 
-You are the pi-credit-risk orchestration agent. The user has invoked
-`/cr-init` to start a new run. Perform the following deterministic steps; do
-not improvise.
+- run_id: `$1`
+- input_csv: `$2`
+- target: `$3`
+- field_meta_csv (optional): `$4`
+- id_col (optional): `$5`
+- time_col (optional): `$6`
 
-1. **Compose `run_config.json`** by merging user arguments into
-   `skills/sklearn-pandas-credit-risk/templates/run_config.template.json`.
-   - Set `run_id`, `input_csv`, `target`, and any provided optional fields.
-   - Set `output_dir` to `runs/<run_id>`.
-   - Leave defaults for tunables unless the user specified otherwise.
+Perform the following deterministic steps. Do not improvise.
 
-2. **Create the run directory** `runs/<run_id>/` (the workflow extension's
-   protected-paths guard allows only writes under `runs/<run_id>/`).
+1. Compose `runs/$1/run_config.json` by starting from `skills/sklearn-pandas-credit-risk/templates/run_config.template.json` and substituting:
+   - `run_id = "$1"`, `input_csv = "$2"`, `target = "$3"`, `output_dir = "runs/$1"`.
+   - `field_meta_csv`, `id_col`, `time_col` if provided as `$4`/`$5`/`$6`.
+   - Keep all other tunable defaults from the template.
 
-3. **Write `run_config.json`** into `runs/<run_id>/run_config.json`.
+2. Create directory `runs/$1/` (the workflow extension's protected-paths guard allows writes only beneath `runs/<run_id>/`).
 
-4. **Validate the config**:
+3. Validate the config:
    ```bash
-   python3 scripts/validate_inputs.py --config runs/<run_id>/run_config.json
+   python3 scripts/validate_inputs.py --config runs/$1/run_config.json
    ```
-   If this fails, surface the error to the user, set manifest status to
-   `FAILED`, and stop.
+   If validation fails, surface the validator error to the user and stop. Do not write `manifest.json`.
 
-5. **Initialize `manifest.json`** by writing:
+4. Write the initial `runs/$1/manifest.json`:
    ```json
    {
-     "run_id": "<run_id>",
+     "run_id": "$1",
      "status": "INPUT_VALIDATED",
      "completed_stages": [],
      "artifacts": {},
      "stage_history": [],
-     "updated_at": "<now>"
+     "updated_at": "<ISO timestamp>"
    }
    ```
 
-6. **Report back** to the user with:
-   - run directory path
-   - the resolved config (with defaults filled in)
-   - the next recommended command, e.g. `/cr-run <run_id> 0-4`.
+5. Respond to the user with:
+   - the run directory path,
+   - the resolved config (with defaults filled in),
+   - the next recommended command (e.g. `/cr-run $1 0-4`).
 
-**Do not** start any stage from this command — `cr-run` is the only command
-that calls the pipeline.
+Do not start any stage from this command — `/cr-run` is the only command that calls the pipeline.

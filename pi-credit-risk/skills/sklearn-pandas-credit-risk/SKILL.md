@@ -1,17 +1,16 @@
 ---
 name: sklearn-pandas-credit-risk
-description: Stable, reproducible credit-risk third-party data evaluation, WOE/IV/PSI analysis, decision-tree rule mining, and rule simulation via a fixed Python pipeline (scripts/run_pipeline.py). Replaces `toad` with pandas + scikit-learn. The agent **orchestrates** the pipeline and **interprets** outputs; it does NOT improvise algorithms. Every run produces a fixed, schema-validated artifact set in `runs/<run_id>/`.
+description: Stable, reproducible credit-risk third-party data evaluation, WOE/IV/PSI analysis, decision-tree rule mining, and rule simulation via a fixed Python pipeline (scripts/run_pipeline.py). Replaces toad with pandas + scikit-learn. The agent orchestrates the pipeline and interprets outputs; it does NOT improvise algorithms. Use this skill when a user asks for credit-risk third-party data admission review, variable validity analysis, rule mining, rule simulation, or pre-go-live review materials. Every run produces a fixed, schema-validated artifact set in runs/<run_id>/.
 allowed-tools: Bash(python3:*) Bash(python:*) Bash(pip:*) Bash(pip3:*) Bash(ls:*) Bash(cat:*) Bash(head:*) Bash(wc:*)
-argument-hint: "Provide (1) run_id, (2) input_csv path, (3) target column, (4) optional field_meta_csv, id_col, time_col. Then say 'run all' or 'run stages 0-4' / 'run stage 5' etc. The /cr-init, /cr-run, /cr-review, /cr-report prompts are the standard entry points."
-user-invocable: true
 metadata:
-    clawdbot:
-        emoji: 🛡️
-        os:
-            - linux
-            - darwin
-        requires:
-            bins: []
+  entry_prompts:
+    - cr-init
+    - cr-run
+    - cr-review
+    - cr-report
+  os:
+    - linux
+    - darwin
 ---
 
 # Sklearn + Pandas Credit-Risk Operating Skill (规范层)

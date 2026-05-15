@@ -6,415 +6,421 @@
  *      runs/<run_id>/manifest.json.
  *   2. Whitelisting bash commands to a safe subset.
  *   3. Restricting file writes to runs/<run_id>/.
- *   4. Auto-validating artifact completeness after each stage and refusing
- *      to advance the state machine on gaps.
+ *   4. Auto-refreshing manifest.json after a successful run_pipeline.py
+ *      invocation (recomputing artifact SHA-256 + advancing manifest.status).
  *   5. Injecting run context (current stage, missing artifacts) into the
- *      agent's prompt at every turn.
+ *      system prompt at every turn via before_agent_start.
  *
- * Reference: https://pi.dev/docs/latest/packages — exact type names may
- * vary by SDK version; this module imports them defensively.
+ * Authoritative API reference:
+ *   https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md
  */
 
-// The exact import shape depends on the installed Pi SDK. We import what we
-// use and the consumer's tsconfig will resolve it.
-import type {
-  ExtensionContext,
-  Tool,
-  ToolCall,
-  ToolCallResult,
-  Hook,
-  AgentTurnContext,
-} from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as crypto from "node:crypto";
 
-import * as fs from "fs";
-import * as path from "path";
-import * as crypto from "crypto";
-import { execSync } from "child_process";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-const PACKAGE_ROOT = path.resolve(__dirname, "..");
-const RUNS_DIR = path.resolve(process.cwd(), "runs");
 
 /**
  * Ordered list of stage ids. cr-run is only allowed to invoke a contiguous
  * range starting from the next expected stage.
  */
 const STAGE_ORDER: ReadonlyArray<string> = [
-  "0",
-  "0.5",
-  "1",
-  "2",
-  "3",
-  "4",
-  "5",
-  "5.1",
-  "5.2",
-  "6",
-  "6.1",
-  "7",
-  "8",
+	"0",
+	"0.5",
+	"1",
+	"2",
+	"3",
+	"4",
+	"5",
+	"5.1",
+	"5.2",
+	"6",
+	"6.1",
+	"7",
+	"8",
 ];
 
-/**
- * Stage status → manifest.status. Used both as a state transition and as the
- * gate check before allowing stage k+1.
- */
 const STAGE_STATUS: Readonly<Record<string, string>> = {
-  "0": "STAGE_0_DONE",
-  "0.5": "STAGE_0_5_DONE",
-  "1": "STAGE_1_DONE",
-  "2": "STAGE_2_DONE",
-  "3": "STAGE_3_DONE",
-  "4": "STAGE_4_DONE",
-  "5": "STAGE_5_DONE",
-  "5.1": "STAGE_5_1_DONE",
-  "5.2": "STAGE_5_2_DONE",
-  "6": "STAGE_6_DONE",
-  "6.1": "STAGE_6_1_DONE",
-  "7": "STAGE_7_DONE",
-  "8": "STAGE_8_DONE",
+	"0": "STAGE_0_DONE",
+	"0.5": "STAGE_0_5_DONE",
+	"1": "STAGE_1_DONE",
+	"2": "STAGE_2_DONE",
+	"3": "STAGE_3_DONE",
+	"4": "STAGE_4_DONE",
+	"5": "STAGE_5_DONE",
+	"5.1": "STAGE_5_1_DONE",
+	"5.2": "STAGE_5_2_DONE",
+	"6": "STAGE_6_DONE",
+	"6.1": "STAGE_6_1_DONE",
+	"7": "STAGE_7_DONE",
+	"8": "STAGE_8_DONE",
 };
 
 /**
  * Required artifacts per stage. Mirrors
- * skills/sklearn-pandas-credit-risk/references/outputs.md and the assertions
- * inside scripts/validate_outputs.py — duplicated here for fast, local
- * pre-flight checks before the Python process is even invoked.
+ * skills/sklearn-pandas-credit-risk/references/outputs.md and
+ * scripts/validate_outputs.py — duplicated here so the extension can do a
+ * fast, local pre-flight check before Python is invoked, and so the
+ * before_agent_start context message can list missing files.
  */
 const REQUIRED_ARTIFACTS: Readonly<Record<string, ReadonlyArray<string>>> = {
-  "0": [
-    "run_config.json",
-    "environment.json",
-    "sample_profile.csv",
-    "sample_split_log.csv",
-    "decision_log.csv",
-  ],
-  "0.5": ["field_audit.csv", "leakage_audit.csv"],
-  "1": ["data_quality.csv", "outlier_summary.csv", "feature_drop_reason.csv"],
-  "2": [
-    "bin_rules.json",
-    "bin_detail.csv",
-    "woe_rules.json",
-    "monotonicity_check.csv",
-    "bin_merge_log.csv",
-  ],
-  "3": ["psi_table.csv", "bin_psi_detail.csv"],
-  "4": ["feature_quality.csv", "feature_correlation.csv"],
-  "5": ["decision_tree.dot", "decision_tree_rules.csv", "rule_overlap_matrix.csv"],
-  "5.1": ["single_rule_candidates.csv", "single_var_rule_eval.csv"],
-  "5.2": ["rule_combination_candidates.csv"],
-  "6": [
-    "strategy_rules.csv",
-    "rule_simulation.csv",
-    "rule_simulation_full.csv",
-    "strategy_comparison.csv",
-    "strategy_level_simulation.csv",
-    "monthly_rule_simulation.csv",
-    "segment_rule_simulation.csv",
-  ],
-  "6.1": [
-    "waterfall_simulation.csv",
-    "waterfall_comparison.csv",
-    "waterfall_simulation_full.csv",
-  ],
-  "7": ["strategy_summary.md", "confidence_evidence.csv"],
-  "8": ["monitoring_plan.csv"],
+	"0": [
+		"run_config.json",
+		"environment.json",
+		"sample_profile.csv",
+		"sample_split_log.csv",
+		"decision_log.csv",
+	],
+	"0.5": ["field_audit.csv", "leakage_audit.csv"],
+	"1": ["data_quality.csv", "outlier_summary.csv", "feature_drop_reason.csv"],
+	"2": [
+		"bin_rules.json",
+		"bin_detail.csv",
+		"woe_rules.json",
+		"monotonicity_check.csv",
+		"bin_merge_log.csv",
+	],
+	"3": ["psi_table.csv", "bin_psi_detail.csv"],
+	"4": ["feature_quality.csv", "feature_correlation.csv"],
+	"5": ["decision_tree.dot", "decision_tree_rules.csv", "rule_overlap_matrix.csv"],
+	"5.1": ["single_rule_candidates.csv", "single_var_rule_eval.csv"],
+	"5.2": ["rule_combination_candidates.csv"],
+	"6": [
+		"strategy_rules.csv",
+		"rule_simulation.csv",
+		"rule_simulation_full.csv",
+		"strategy_comparison.csv",
+		"strategy_level_simulation.csv",
+		"monthly_rule_simulation.csv",
+		"segment_rule_simulation.csv",
+	],
+	"6.1": [
+		"waterfall_simulation.csv",
+		"waterfall_comparison.csv",
+		"waterfall_simulation_full.csv",
+	],
+	"7": ["strategy_summary.md", "confidence_evidence.csv"],
+	"8": ["monitoring_plan.csv"],
 };
 
 /**
- * Bash whitelist. The agent may only invoke commands whose first non-empty
- * token matches one of these patterns.
- *
- * Notes:
- *   • `python3 scripts/...` is the ONLY way to run computations.
- *   • `pip install -r requirements.txt` is allowed once at init.
- *   • Read-only file inspection is allowed for the agent to read its own
- *     run directory.
+ * Bash whitelist. The agent may only invoke commands whose trimmed text
+ * matches one of these patterns.
  */
 const BASH_WHITELIST: ReadonlyArray<RegExp> = [
-  /^python3?\s+scripts\/(run_pipeline|validate_inputs|validate_outputs|run_stage|render_report)\.py(\s|$)/,
-  /^python3?\s+-m\s+pytest(\s|$)/,
-  /^python3?\s+-c\s/,
-  /^pip3?\s+install\s+-r\s+requirements\.txt(\s|$)/,
-  /^(ls|cat|head|tail|wc|file|stat)(\s|$)/,
-  /^git\s+(status|log|diff|show)(\s|$)/,
+	/^python3?\s+scripts\/(run_pipeline|validate_inputs|validate_outputs|run_stage|render_report)\.py(\s|$)/,
+	/^python3?\s+-m\s+pytest(\s|$)/,
+	/^python3?\s+-c\s/,
+	/^pip3?\s+install\s+-r\s+requirements\.txt(\s|$)/,
+	/^(ls|cat|head|tail|wc|file|stat)(\s|$)/,
+	/^git\s+(status|log|diff|show)(\s|$)/,
 ];
 
 /**
- * Path-write whitelist. Writes are allowed only beneath runs/<run_id>/
- * (any run_id) and a small set of package-managed directories during initial
- * scaffolding.
+ * Path-write whitelist. Writes (write/edit/create tools) are allowed only
+ * beneath runs/<run_id>/ (any run_id).
  */
-const WRITE_WHITELIST: ReadonlyArray<RegExp> = [
-  /^runs\/[A-Za-z0-9][A-Za-z0-9_.\-\/]*$/,
-];
+const WRITE_WHITELIST_RE = /^runs[/\\][A-Za-z0-9][A-Za-z0-9_.\-/\\]*$/;
 
 // ---------------------------------------------------------------------------
 // Manifest helpers
 // ---------------------------------------------------------------------------
 
 interface Manifest {
-  run_id: string;
-  status: string;
-  completed_stages: string[];
-  artifacts: Record<string, string>;
-  config_sha256?: string;
-  input_sha256?: string;
-  environment?: Record<string, unknown>;
-  stage_history?: Array<Record<string, unknown>>;
-  last_error?: string | null;
-  updated_at: string;
+	run_id: string;
+	status: string;
+	completed_stages: string[];
+	artifacts: Record<string, string>;
+	stage_history?: Array<Record<string, unknown>>;
+	last_error?: string | null;
+	updated_at: string;
 }
 
-function manifestPath(runId: string): string {
-  return path.join(RUNS_DIR, runId, "manifest.json");
+function runsDir(cwd: string): string {
+	return path.join(cwd, "runs");
 }
 
-function readManifest(runId: string): Manifest | null {
-  const p = manifestPath(runId);
-  if (!fs.existsSync(p)) return null;
-  return JSON.parse(fs.readFileSync(p, "utf-8")) as Manifest;
+function manifestPath(cwd: string, runId: string): string {
+	return path.join(runsDir(cwd), runId, "manifest.json");
 }
 
-function writeManifest(runId: string, m: Manifest): void {
-  m.updated_at = new Date().toISOString();
-  fs.writeFileSync(manifestPath(runId), JSON.stringify(m, null, 2));
+function readManifest(cwd: string, runId: string): Manifest | null {
+	const p = manifestPath(cwd, runId);
+	if (!fs.existsSync(p)) return null;
+	try {
+		return JSON.parse(fs.readFileSync(p, "utf-8")) as Manifest;
+	} catch {
+		return null;
+	}
+}
+
+function writeManifest(cwd: string, runId: string, m: Manifest): void {
+	m.updated_at = new Date().toISOString();
+	fs.writeFileSync(manifestPath(cwd, runId), JSON.stringify(m, null, 2));
 }
 
 function sha256(filePath: string): string {
-  const buf = fs.readFileSync(filePath);
-  return "sha256:" + crypto.createHash("sha256").update(buf).digest("hex");
+	const buf = fs.readFileSync(filePath);
+	return `sha256:${crypto.createHash("sha256").update(buf).digest("hex")}`;
 }
 
 function nextExpectedStage(m: Manifest): string | null {
-  for (const s of STAGE_ORDER) {
-    if (!m.completed_stages.includes(s)) return s;
-  }
-  return null;
+	for (const s of STAGE_ORDER) {
+		if (!m.completed_stages.includes(s)) return s;
+	}
+	return null;
 }
 
-function missingArtifacts(runId: string, stage: string): string[] {
-  const required = REQUIRED_ARTIFACTS[stage] || [];
-  const runDir = path.join(RUNS_DIR, runId);
-  return required.filter((rel) => !fs.existsSync(path.join(runDir, rel)));
-}
-
-// ---------------------------------------------------------------------------
-// Guards
-// ---------------------------------------------------------------------------
-
-/**
- * Block any bash command not matching BASH_WHITELIST.
- */
-function bashGuard(call: ToolCall): ToolCallResult | null {
-  if (call.tool !== "bash") return null;
-  const cmd = String(call.arguments?.command ?? "").trim();
-  if (!cmd) return null;
-  const allowed = BASH_WHITELIST.some((re) => re.test(cmd));
-  if (!allowed) {
-    return {
-      ok: false,
-      error:
-        `[pi-credit-risk] bash command refused by extension whitelist.\n` +
-        `Got: ${cmd}\n` +
-        `Allowed patterns:\n  - python3 scripts/<run_pipeline|validate_inputs|validate_outputs|run_stage|render_report>.py\n` +
-        `  - python3 -m pytest …\n` +
-        `  - python3 -c "…"\n` +
-        `  - pip install -r requirements.txt\n` +
-        `  - ls/cat/head/tail/wc/file/stat …\n` +
-        `  - git status/log/diff/show …`,
-    };
-  }
-  return null;
+function missingArtifacts(cwd: string, runId: string, stage: string): string[] {
+	const required = REQUIRED_ARTIFACTS[stage] ?? [];
+	const runDir = path.join(runsDir(cwd), runId);
+	return required.filter((rel) => !fs.existsSync(path.join(runDir, rel)));
 }
 
 /**
- * Block any write whose path falls outside WRITE_WHITELIST.
+ * Parse `--config <path> --stage <id>` (any order) out of a python command.
+ * Returns { config, stage } or null if either flag is missing.
  */
-function pathWriteGuard(call: ToolCall): ToolCallResult | null {
-  if (!["create", "edit", "write_file"].includes(call.tool)) return null;
-  const target = String(call.arguments?.path ?? "");
-  const rel = path.relative(process.cwd(), path.resolve(target));
-  const allowed = WRITE_WHITELIST.some((re) => re.test(rel));
-  if (!allowed) {
-    return {
-      ok: false,
-      error:
-        `[pi-credit-risk] file write refused: ${rel}. ` +
-        `Writes are allowed only beneath runs/<run_id>/. ` +
-        `If you need to modify package source, do it outside the agent.`,
-    };
-  }
-  return null;
-}
-
-/**
- * Refuse stage invocations that violate stage order, and refresh manifest
- * after a successful invocation.
- */
-function pipelineGuardBefore(call: ToolCall): ToolCallResult | null {
-  if (call.tool !== "bash") return null;
-  const cmd = String(call.arguments?.command ?? "");
-  const m = cmd.match(/scripts\/run_pipeline\.py.*--stage\s+(\S+)/);
-  if (!m) return null;
-  const requestedStage = m[1];
-  const configMatch = cmd.match(/--config\s+(\S+)/);
-  if (!configMatch) return null;
-  const config = JSON.parse(fs.readFileSync(configMatch[1], "utf-8"));
-  const runId = config.run_id;
-  const manifest = readManifest(runId);
-  if (!manifest) {
-    return {
-      ok: false,
-      error: `[pi-credit-risk] manifest.json missing for run_id=${runId}. Run /cr-init first.`,
-    };
-  }
-  if (requestedStage === "all") return null; // pipeline self-orders
-  const expected = nextExpectedStage(manifest);
-  if (expected !== null && requestedStage !== expected) {
-    return {
-      ok: false,
-      error:
-        `[pi-credit-risk] stage out of order. ` +
-        `Manifest says next expected stage = ${expected}, you requested = ${requestedStage}. ` +
-        `Either invoke the expected stage or roll back manifest.completed_stages.`,
-    };
-  }
-  return null;
-}
-
-/**
- * Post-stage hook: confirm required artifacts now exist on disk, refresh
- * SHA-256s in manifest.json, and advance manifest.status. If anything is
- * missing, manifest.last_error is set and status stays at the previous value.
- */
-function pipelineHookAfter(call: ToolCall, result: ToolCallResult): void {
-  if (call.tool !== "bash") return;
-  const cmd = String(call.arguments?.command ?? "");
-  const m = cmd.match(/scripts\/run_pipeline\.py.*--stage\s+(\S+).*--config\s+(\S+)/) ||
-            cmd.match(/scripts\/run_pipeline\.py.*--config\s+(\S+).*--stage\s+(\S+)/);
-  if (!m) return;
-  const stage = m[1].startsWith("--") ? m[2] : m[1];
-  const configPath = m[1].startsWith("--") ? m[1] : m[2];
-  const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-  const runId = config.run_id;
-  const manifest = readManifest(runId);
-  if (!manifest) return;
-
-  const stagesToCheck = stage === "all" ? STAGE_ORDER : [stage];
-  for (const s of stagesToCheck) {
-    const missing = missingArtifacts(runId, s);
-    if (missing.length > 0) {
-      manifest.last_error = `stage ${s} missing artifacts: ${missing.join(", ")}`;
-      writeManifest(runId, manifest);
-      return;
-    }
-    // Refresh hashes
-    const runDir = path.join(RUNS_DIR, runId);
-    for (const rel of REQUIRED_ARTIFACTS[s] || []) {
-      manifest.artifacts[rel] = sha256(path.join(runDir, rel));
-    }
-    if (!manifest.completed_stages.includes(s)) manifest.completed_stages.push(s);
-    manifest.status = STAGE_STATUS[s] ?? manifest.status;
-    manifest.last_error = null;
-  }
-  writeManifest(runId, manifest);
+function parsePipelineFlags(
+	cmd: string,
+): { config: string; stage: string } | null {
+	const cfg = cmd.match(/--config\s+(\S+)/);
+	const stg = cmd.match(/--stage\s+(\S+)/);
+	if (!cfg || !stg) return null;
+	return { config: cfg[1], stage: stg[1] };
 }
 
 // ---------------------------------------------------------------------------
-// Context injection
+// Extension factory
 // ---------------------------------------------------------------------------
 
-/**
- * Before each agent turn, prepend a system message describing the active run:
- * its current stage, missing artifacts, last error. This prevents "amnesia"
- * across multi-turn conversations.
- */
-function beforeAgentStart(ctx: AgentTurnContext): void {
-  // Detect the active run from the most recent user message, e.g.
-  // /cr-run <run_id> … or /cr-review <run_id>.
-  const text = ctx.lastUserMessage ?? "";
-  const m = text.match(/\/cr-(?:init|run|review|report|status)\s+(\S+)/);
-  if (!m) return;
-  const runId = m[1];
-  const manifest = readManifest(runId);
-  if (!manifest) return;
-  const expected = nextExpectedStage(manifest);
-  const lines: string[] = [
-    `[pi-credit-risk context]`,
-    `run_id: ${runId}`,
-    `status: ${manifest.status}`,
-    `completed_stages: ${manifest.completed_stages.join(", ") || "(none)"}`,
-    `next_expected_stage: ${expected ?? "(all done)"}`,
-  ];
-  if (manifest.last_error) lines.push(`last_error: ${manifest.last_error}`);
-  if (expected) {
-    const missing = missingArtifacts(runId, expected);
-    if (missing.length > 0) {
-      lines.push(`missing_for_next_stage: ${missing.join(", ")}`);
-    }
-  }
-  ctx.appendSystemEntry?.(lines.join("\n"));
+export default function pi_credit_risk(pi: ExtensionAPI) {
+	// =========================================================================
+	// Guard #1 — bash whitelist
+	// =========================================================================
+	pi.on("tool_call", async (event, ctx) => {
+		if (!isToolCallEventType("bash", event)) return undefined;
+		const cmd = String(event.input.command ?? "").trim();
+		if (!cmd) return undefined;
+		const allowed = BASH_WHITELIST.some((re) => re.test(cmd));
+		if (!allowed) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(`pi-credit-risk: refused bash command`, "warning");
+			}
+			return {
+				block: true,
+				reason:
+					`[pi-credit-risk] bash command refused by extension whitelist.\n` +
+					`Got: ${cmd}\n` +
+					`Allowed patterns:\n` +
+					`  - python3 scripts/{run_pipeline,validate_inputs,validate_outputs,run_stage,render_report}.py\n` +
+					`  - python3 -m pytest …\n` +
+					`  - python3 -c "…"\n` +
+					`  - pip install -r requirements.txt\n` +
+					`  - ls/cat/head/tail/wc/file/stat …\n` +
+					`  - git status/log/diff/show …`,
+			};
+		}
+		return undefined;
+	});
+
+	// =========================================================================
+	// Guard #2 — protected paths (writes only beneath runs/<run_id>/)
+	// =========================================================================
+	pi.on("tool_call", async (event, ctx) => {
+		if (
+			event.toolName !== "write" &&
+			event.toolName !== "edit" &&
+			event.toolName !== "create"
+		) {
+			return undefined;
+		}
+		const target = String((event.input as { path?: string }).path ?? "");
+		if (!target) return undefined;
+		const rel = path.relative(ctx.cwd, path.resolve(ctx.cwd, target));
+		const inRunsDir = WRITE_WHITELIST_RE.test(rel);
+		if (!inRunsDir) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(`pi-credit-risk: blocked write to ${rel}`, "warning");
+			}
+			return {
+				block: true,
+				reason:
+					`[pi-credit-risk] file write refused: ${rel}. ` +
+					`Writes are allowed only beneath runs/<run_id>/. ` +
+					`If you need to modify package source, edit it outside the agent and reinstall.`,
+			};
+		}
+		return undefined;
+	});
+
+	// =========================================================================
+	// Guard #3 — pipeline stage order
+	// =========================================================================
+	pi.on("tool_call", async (event, _ctx) => {
+		if (!isToolCallEventType("bash", event)) return undefined;
+		const cmd = String(event.input.command ?? "");
+		if (!/scripts\/run_pipeline\.py/.test(cmd)) return undefined;
+		const flags = parsePipelineFlags(cmd);
+		if (!flags) return undefined;
+		if (flags.stage === "all") return undefined; // pipeline self-orders
+		let config: { run_id?: string } = {};
+		try {
+			config = JSON.parse(fs.readFileSync(flags.config, "utf-8"));
+		} catch {
+			return {
+				block: true,
+				reason: `[pi-credit-risk] cannot read config ${flags.config}`,
+			};
+		}
+		if (!config.run_id) {
+			return {
+				block: true,
+				reason: `[pi-credit-risk] config ${flags.config} is missing run_id.`,
+			};
+		}
+		const m = readManifest(_ctx.cwd, config.run_id);
+		if (!m) {
+			return {
+				block: true,
+				reason: `[pi-credit-risk] manifest.json missing for run_id=${config.run_id}. Run /cr-init first.`,
+			};
+		}
+		const expected = nextExpectedStage(m);
+		if (expected !== null && flags.stage !== expected) {
+			return {
+				block: true,
+				reason:
+					`[pi-credit-risk] stage out of order. ` +
+					`manifest says next expected = ${expected}, you requested = ${flags.stage}. ` +
+					`Run the expected stage first.`,
+			};
+		}
+		return undefined;
+	});
+
+	// =========================================================================
+	// Hook — refresh manifest.json after a successful pipeline invocation
+	// =========================================================================
+	pi.on("tool_result", async (event, ctx) => {
+		if (event.toolName !== "bash" || event.isError) return undefined;
+		const cmd = String((event.input as { command?: string }).command ?? "");
+		if (!/scripts\/run_pipeline\.py/.test(cmd)) return undefined;
+		const flags = parsePipelineFlags(cmd);
+		if (!flags) return undefined;
+		let config: { run_id?: string } = {};
+		try {
+			config = JSON.parse(fs.readFileSync(flags.config, "utf-8"));
+		} catch {
+			return undefined;
+		}
+		if (!config.run_id) return undefined;
+		const m = readManifest(ctx.cwd, config.run_id);
+		if (!m) return undefined;
+
+		const stagesToCheck = flags.stage === "all" ? STAGE_ORDER : [flags.stage];
+		for (const s of stagesToCheck) {
+			const missing = missingArtifacts(ctx.cwd, config.run_id, s);
+			if (missing.length > 0) {
+				m.last_error = `stage ${s} missing artifacts: ${missing.join(", ")}`;
+				writeManifest(ctx.cwd, config.run_id, m);
+				return undefined;
+			}
+			const runDir = path.join(runsDir(ctx.cwd), config.run_id);
+			for (const rel of REQUIRED_ARTIFACTS[s] ?? []) {
+				m.artifacts[rel] = sha256(path.join(runDir, rel));
+			}
+			if (!m.completed_stages.includes(s)) m.completed_stages.push(s);
+			m.status = STAGE_STATUS[s] ?? m.status;
+			m.last_error = null;
+		}
+		writeManifest(ctx.cwd, config.run_id, m);
+		return undefined;
+	});
+
+	// =========================================================================
+	// Context injection — prepend run state to the system prompt
+	// =========================================================================
+	pi.on("before_agent_start", async (event) => {
+		const text = event.prompt ?? "";
+		const m = text.match(/\/cr-(?:init|run|review|report|status)\s+(\S+)/);
+		if (!m) return undefined;
+		const runId = m[1];
+		// ctx is not passed to before_agent_start in some versions; use cwd from
+		// the systemPromptOptions if available, else process.cwd().
+		const cwd = event.systemPromptOptions?.cwd ?? process.cwd();
+		const manifest = readManifest(cwd, runId);
+		if (!manifest) return undefined;
+		const expected = nextExpectedStage(manifest);
+		const lines: string[] = [
+			`## pi-credit-risk run context`,
+			``,
+			`- run_id: \`${runId}\``,
+			`- status: \`${manifest.status}\``,
+			`- completed_stages: ${
+				manifest.completed_stages.length > 0 ? manifest.completed_stages.join(", ") : "(none)"
+			}`,
+			`- next_expected_stage: ${expected ?? "(all done)"}`,
+		];
+		if (manifest.last_error) lines.push(`- last_error: ${manifest.last_error}`);
+		if (expected) {
+			const missing = missingArtifacts(cwd, runId, expected);
+			if (missing.length > 0) {
+				lines.push(`- missing_for_next_stage: ${missing.join(", ")}`);
+			}
+		}
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n${lines.join("\n")}\n`,
+		};
+	});
+
+	// =========================================================================
+	// Custom tool — /cr-status equivalent for the LLM
+	// =========================================================================
+	pi.registerTool({
+		name: "cr_status",
+		label: "cr-status",
+		description:
+			"Read runs/<run_id>/manifest.json and report status, completed stages, missing artifacts, and last error. Use when the user asks 'what's the status of run X' or before invoking /cr-run to confirm the next expected stage.",
+		parameters: Type.Object({
+			run_id: Type.String({ description: "The run identifier." }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const m = readManifest(ctx.cwd, params.run_id);
+			if (!m) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `manifest.json not found for run_id=${params.run_id}.`,
+						},
+					],
+					details: {},
+					isError: true,
+				};
+			}
+			const expected = nextExpectedStage(m);
+			const missing = expected ? missingArtifacts(ctx.cwd, params.run_id, expected) : [];
+			const payload = {
+				run_id: m.run_id,
+				status: m.status,
+				completed_stages: m.completed_stages,
+				next_expected_stage: expected,
+				missing_for_next_stage: missing,
+				last_error: m.last_error ?? null,
+				updated_at: m.updated_at,
+			};
+			return {
+				content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+				details: payload,
+			};
+		},
+	});
 }
-
-// ---------------------------------------------------------------------------
-// Tools — /cr-status (optional convenience)
-// ---------------------------------------------------------------------------
-
-const crStatusTool: Tool = {
-  name: "cr_status",
-  description:
-    "Read runs/<run_id>/manifest.json and report status, completed_stages, missing artifacts, last_error.",
-  inputSchema: {
-    type: "object",
-    required: ["run_id"],
-    properties: { run_id: { type: "string" } },
-  },
-  async run(args: { run_id: string }): Promise<ToolCallResult> {
-    const m = readManifest(args.run_id);
-    if (!m) {
-      return { ok: false, error: `manifest.json not found for run_id=${args.run_id}` };
-    }
-    const expected = nextExpectedStage(m);
-    const missing = expected ? missingArtifacts(args.run_id, expected) : [];
-    return {
-      ok: true,
-      data: {
-        run_id: m.run_id,
-        status: m.status,
-        completed_stages: m.completed_stages,
-        next_expected_stage: expected,
-        missing_for_next_stage: missing,
-        last_error: m.last_error ?? null,
-        updated_at: m.updated_at,
-      },
-    };
-  },
-};
-
-// ---------------------------------------------------------------------------
-// Activation
-// ---------------------------------------------------------------------------
-
-export function activate(ctx: ExtensionContext): void {
-  // Register pre-tool-call hooks (guards).
-  ctx.registerHook("before_tool_call", (call: ToolCall) => {
-    return bashGuard(call) ?? pathWriteGuard(call) ?? pipelineGuardBefore(call);
-  });
-
-  // Register post-tool-call hooks (manifest refresh).
-  ctx.registerHook("after_tool_call", (call: ToolCall, result: ToolCallResult) => {
-    if (result.ok) pipelineHookAfter(call, result);
-  });
-
-  // Register context-injection hook.
-  ctx.registerHook("before_agent_start", beforeAgentStart);
-
-  // Register the /cr-status tool.
-  ctx.registerTool(crStatusTool);
-}
-
-export default { activate };
