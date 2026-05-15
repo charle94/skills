@@ -1,0 +1,9 @@
+feature,source,meaning,available_time,pre_decision_available,post_loan_field
+age,internal,申请人年龄,pre_decision,True,False
+income,external,月收入,pre_decision,True,False
+credit_score,bureau,征信评分,pre_decision,True,False
+loan_amount,internal,申请金额,pre_decision,True,False
+debt_ratio,bureau,负债比,pre_decision,True,False
+overdue_times,internal,历史逾期次数,post_decision,False,True
+employment_type,internal,就业类型,pre_decision,True,False
+residence_years,internal,居住年限,pre_decision,True,False

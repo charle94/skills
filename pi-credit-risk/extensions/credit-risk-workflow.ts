@@ -106,8 +106,8 @@ const REQUIRED_ARTIFACTS: Readonly<Record<string, ReadonlyArray<string>>> = {
 		"waterfall_comparison.csv",
 		"waterfall_simulation_full.csv",
 	],
-	"7": ["strategy_summary.md", "confidence_evidence.csv"],
-	"8": ["monitoring_plan.csv"],
+	"7": ["confidence_evidence.csv"],
+	"8": ["monitoring_plan.csv", "strategy_summary.md"],
 };
 
 /**
