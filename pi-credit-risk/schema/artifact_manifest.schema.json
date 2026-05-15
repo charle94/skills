@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "pi-credit-risk artifact manifest",
+  "description": "Persistent state for a single run: state machine + completed stages + per-artifact SHA-256 hashes.",
+  "type": "object",
+  "required": ["run_id", "status", "completed_stages", "artifacts", "updated_at"],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {"type": "string"},
+    "status": {
+      "type": "string",
+      "enum": [
+        "INIT",
+        "CONFIG_READY",
+        "INPUT_VALIDATED",
+        "STAGE_0_DONE",
+        "STAGE_0_5_DONE",
+        "STAGE_1_DONE",
+        "STAGE_2_DONE",
+        "STAGE_3_DONE",
+        "STAGE_4_DONE",
+        "STAGE_5_DONE",
+        "STAGE_5_1_DONE",
+        "STAGE_5_2_DONE",
+        "STAGE_6_DONE",
+        "STAGE_6_1_DONE",
+        "STAGE_7_DONE",
+        "STAGE_8_DONE",
+        "REVIEW_READY",
+        "EXPORTED",
+        "FAILED"
+      ]
+    },
+    "completed_stages": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Ordered list of stage IDs already finished (e.g. ['0','0.5','1','2'])."
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^sha256:[0-9a-f]{64}$"
+      },
+      "description": "Map of artifact relative path -> sha256:<hex>."
+    },
+    "config_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "input_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "environment": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Copy of environment.json keys (python, pandas, numpy, sklearn versions, platform)."
+    },
+    "stage_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "stage": {"type": "string"},
+          "started_at": {"type": "string"},
+          "finished_at": {"type": "string"},
+          "status": {"type": "string"},
+          "missing_artifacts": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "last_error": {"type": ["string", "null"]},
+    "updated_at": {"type": "string"}
+  }
+}
